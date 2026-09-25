@@ -8,6 +8,7 @@
 - 第三方依赖：**无**（仅使用系统组件：OpenGL、Media Foundation、WIC、Win32 / COM / Shell）
 - 当前版本：0.1.0
 
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 ---
 
 ## 功能特性
