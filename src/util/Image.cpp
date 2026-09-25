@@ -16,21 +16,35 @@ namespace {
 
 using Microsoft::WRL::ComPtr;
 
-// WIC 工厂按需创建并缓存（COM 已由调用方初始化）
+// WIC 工厂按需创建并缓存（COM 已由调用方初始化）。
+// 界面线程与后台保存线程都会调用，故用函数级静态变量保证只初始化一次，
+// 避免并发首次调用时互相覆盖导致工厂被提前释放。
 IWICImagingFactory* ImagingFactory() {
-    static ComPtr<IWICImagingFactory> factory;
-    if (!factory) {
-        ComPtr<IWICImagingFactory> created;
+    static IWICImagingFactory* factory = []() -> IWICImagingFactory* {
+        IWICImagingFactory* created = nullptr;
         const HRESULT hr = ::CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-                                             CLSCTX_INPROC_SERVER,
-                                             IID_PPV_ARGS(created.GetAddressOf()));
+                                             CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&created));
         if (FAILED(hr)) {
             VB_ERROR("创建 WIC 工厂失败: %ls", HresultToWide(hr).c_str());
             return nullptr;
         }
-        factory = created;
+        return created;
+    }();
+    return factory;
+}
+
+// 打开图片文件并取第一帧（加载与缩略图共用同一套解码器创建流程）
+bool OpenFirstFrame(IWICImagingFactory* factory, const std::wstring& path,
+                    ComPtr<IWICBitmapDecoder>& decoder, ComPtr<IWICBitmapFrameDecode>& frame) {
+    const HRESULT hr = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
+                                                         WICDecodeMetadataCacheOnDemand,
+                                                         decoder.GetAddressOf());
+    if (FAILED(hr)) {
+        VB_WARN("解码图片失败（创建解码器）: %ls, %ls", path.c_str(),
+                HresultToWide(hr).c_str());
+        return false;
     }
-    return factory.Get();
+    return SUCCEEDED(decoder->GetFrame(0, frame.GetAddressOf()));
 }
 
 } // namespace
@@ -44,23 +58,13 @@ bool Image::LoadFromFile(const std::wstring& path) {
     }
 
     ComPtr<IWICBitmapDecoder> decoder;
-    HRESULT hr = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                   WICDecodeMetadataCacheOnDemand,
-                                                   decoder.GetAddressOf());
-    if (FAILED(hr)) {
-        VB_WARN("解码图片失败（创建解码器）: %ls, %ls", path.c_str(),
-                HresultToWide(hr).c_str());
-        return false;
-    }
-
     ComPtr<IWICBitmapFrameDecode> frame;
-    hr = decoder->GetFrame(0, frame.GetAddressOf());
-    if (FAILED(hr)) {
+    if (!OpenFirstFrame(factory, path, decoder, frame)) {
         return false;
     }
 
     ComPtr<IWICFormatConverter> converter;
-    hr = factory->CreateFormatConverter(converter.GetAddressOf());
+    HRESULT hr = factory->CreateFormatConverter(converter.GetAddressOf());
     if (FAILED(hr)) {
         return false;
     }
@@ -108,24 +112,14 @@ bool Image::LoadThumbnail(const std::wstring& path, int maxEdge) {
     }
 
     ComPtr<IWICBitmapDecoder> decoder;
-    HRESULT hr = factory->CreateDecoderFromFilename(path.c_str(), nullptr, GENERIC_READ,
-                                                   WICDecodeMetadataCacheOnDemand,
-                                                   decoder.GetAddressOf());
-    if (FAILED(hr)) {
-        VB_WARN("缩略图解码失败（创建解码器）: %ls, %ls", path.c_str(),
-                HresultToWide(hr).c_str());
-        return false;
-    }
-
     ComPtr<IWICBitmapFrameDecode> frame;
-    hr = decoder->GetFrame(0, frame.GetAddressOf());
-    if (FAILED(hr)) {
+    if (!OpenFirstFrame(factory, path, decoder, frame)) {
         return false;
     }
 
     UINT sourceWidth = 0;
     UINT sourceHeight = 0;
-    hr = frame->GetSize(&sourceWidth, &sourceHeight);
+    HRESULT hr = frame->GetSize(&sourceWidth, &sourceHeight);
     if (FAILED(hr) || sourceWidth == 0 || sourceHeight == 0) {
         return false;
     }

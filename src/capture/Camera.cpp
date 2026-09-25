@@ -385,7 +385,7 @@ bool CameraCapture::OpenOnCaptureThread(const OpenRequest& request) {
 
     ApplyExposure(source_, request.autoExposure);
 
-    // 记录实际协商到的采集分辨率
+    // 记录实际协商到的采集分辨率，供采集循环打包帧时使用
     UINT32 actualWidth = 0;
     UINT32 actualHeight = 0;
     {
@@ -394,6 +394,8 @@ bool CameraCapture::OpenOnCaptureThread(const OpenRequest& request) {
             ::MFGetAttributeSize(current.Get(), MF_MT_FRAME_SIZE, &actualWidth, &actualHeight);
         }
     }
+    frameWidth_ = actualWidth > 0 ? static_cast<int>(actualWidth) : request.width;
+    frameHeight_ = actualHeight > 0 ? static_cast<int>(actualHeight) : request.height;
     VB_INFO("摄像头已打开: %ls (%ux%u@%d, 请求 %dx%d)", deviceName_.c_str(), actualWidth,
             actualHeight, request.fps, request.width, request.height);
     return true;
@@ -457,21 +459,9 @@ void CameraCapture::CaptureLoop() {
 
         ComPtr<IMFMediaBuffer> buffer;
         if (SUCCEEDED(sample->ConvertToContiguousBuffer(buffer.GetAddressOf()))) {
-            // 帧尺寸以协商后的媒体类型为准，Lock2D 的步长仅用于逐行寻址
-            int frameWidth = 0;
-            int frameHeight = 0;
-            {
-                ComPtr<IMFMediaType> current;
-                if (SUCCEEDED(reader_->GetCurrentMediaType(kFirstVideoStream,
-                                                          current.GetAddressOf()))) {
-                    UINT32 w = 0;
-                    UINT32 h = 0;
-                    if (SUCCEEDED(::MFGetAttributeSize(current.Get(), MF_MT_FRAME_SIZE, &w, &h))) {
-                        frameWidth = static_cast<int>(w);
-                        frameHeight = static_cast<int>(h);
-                    }
-                }
-            }
+            // 帧尺寸取自打开时协商的媒体类型，Lock2D 的步长仅用于逐行寻址
+            const int frameWidth = frameWidth_;
+            const int frameHeight = frameHeight_;
 
             bool copied = false;
             if (frameWidth > 0 && frameHeight > 0) {

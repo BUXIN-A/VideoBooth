@@ -56,7 +56,6 @@ private:
     bool EnsureMask(int width, int height);
     HFONT FontFor(int fontPixels);
     uint8_t* At(int x, int y) { return bits_ + static_cast<ptrdiff_t>(y) * stride_ + x * 4; }
-    void BlendPixel(int x, int y, float red, float green, float blue, float alpha);
     void FillSpan(int x0, int x1, int y, COLORREF color, BYTE alpha);
 
     HDC dc_ = nullptr;

@@ -31,10 +31,6 @@ bool SameView(const PreviewView& a, const PreviewView& b) {
 
 } // namespace
 
-bool PreviewPanel::Init() {
-    return true;
-}
-
 void PreviewPanel::SetScale(float uiScale) {
     scale_ = std::max(0.5f, uiScale);
 }
@@ -129,9 +125,6 @@ bool PreviewPanel::Update() {
                                  static_cast<float>(rotatedHeight));
     const float bottom = ClampFloat(centerY + visibleHeight * 0.5f, 0.0f,
                                     static_cast<float>(rotatedHeight));
-
-    visibleInImage_ = {static_cast<LONG>(left), static_cast<LONG>(top),
-                       static_cast<LONG>(right), static_cast<LONG>(bottom)};
 
     RECT viewport = {imageLeft + static_cast<int>(left * previewScale_),
                      imageTop + static_cast<int>(top * previewScale_),

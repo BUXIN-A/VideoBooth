@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <cstring>
 
 namespace vb {
 namespace gfx {
@@ -70,13 +71,12 @@ bool Texture::Upload(const uint8_t* bgra, int width, int height, int stride) {
 
     const uint8_t* source = bgra;
     if (stride != width * 4) {
-        packed_.resize(static_cast<size_t>(width) * 4u * static_cast<size_t>(height));
+        // 行步长不连续时先整理为紧凑缓冲再上传
+        const size_t rowBytes = static_cast<size_t>(width) * 4u;
+        packed_.resize(rowBytes * static_cast<size_t>(height));
         for (int y = 0; y < height; ++y) {
-            const uint8_t* src = bgra + static_cast<ptrdiff_t>(y) * stride;
-            uint8_t* dst = packed_.data() + static_cast<size_t>(y) * width * 4u;
-            for (int x = 0; x < width * 4; ++x) {
-                dst[x] = src[x];
-            }
+            std::memcpy(packed_.data() + rowBytes * static_cast<size_t>(y),
+                        bgra + static_cast<ptrdiff_t>(y) * stride, rowBytes);
         }
         source = packed_.data();
     }

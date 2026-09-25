@@ -29,7 +29,7 @@ inline constexpr int kToolButtonCount = static_cast<int>(ToolButtonId::Count);
 // 底部或两侧功能栏
 class Toolbar {
 public:
-    bool Init(Resources* resources, bool vertical);
+    void Init(Resources* resources, bool vertical);
 
     void SetScale(float uiScale);
     void SetVertical(bool vertical) { vertical_ = vertical; }
@@ -43,7 +43,6 @@ public:
     const RECT& buttonRect(int index) const;
 
     void SetActive(int index, bool active);
-    bool isActive(int index) const;
     void SetEnabled(bool enabled) { enabled_ = enabled; }
 
     // 覆盖按钮的图标与文字（相册查看时“拍照”变为“返回相机”），传 nullptr 恢复默认

@@ -6,7 +6,6 @@
 #include "util/Strings.h"
 
 #include <algorithm>
-#include <cmath>
 
 namespace vb {
 namespace ui {
@@ -136,7 +135,7 @@ SettingsDialog::Choice* SettingsDialog::FindChoice(Field field) {
     return nullptr;
 }
 
-bool SettingsDialog::Open(HWND owner, const core::AppConfig& config,
+void SettingsDialog::Open(HWND owner, const core::AppConfig& config,
                           const std::vector<capture::CameraInfo>& cameras, float uiScale,
                           int clientWidth, int clientHeight) {
     owner_ = owner;
@@ -155,8 +154,6 @@ bool SettingsDialog::Open(HWND owner, const core::AppConfig& config,
 
     BuildModel();
     Relayout(clientWidth, clientHeight);
-    VB_INFO("设置面板已展开（%dx%d，缩放 %.2f）", windowWidth_, windowHeight_, uiScale_);
-    return true;
 }
 
 void SettingsDialog::Close() {
@@ -299,6 +296,8 @@ void SettingsDialog::BuildModel() {
     }
     choices_.push_back(fps);
 
+    resolutionWidths_.clear();
+    resolutionHeights_.clear();
     for (const ResolutionPreset& preset : kResolutionPresets) {
         resolutionWidths_.push_back(preset.width);
         resolutionHeights_.push_back(preset.height);
@@ -391,8 +390,8 @@ void SettingsDialog::UpdateLayout() {
 
     bodyTop_ = P(kTitleBarHeight);
     bodyBottom_ = windowHeight_ - P(kFooterHeight);
-    contentHeight_ = P(kContentHeight);
-    maxScroll_ = std::max(0, contentHeight_ - (bodyBottom_ - bodyTop_));
+    const int contentHeight = P(kContentHeight);
+    maxScroll_ = std::max(0, contentHeight - (bodyBottom_ - bodyTop_));
     scrollY_ = std::max(0, std::min(scrollY_, maxScroll_));
 
     const int cardLeft = P(kMargin);
@@ -728,6 +727,15 @@ void SettingsDialog::Render() {
     const auto rowTop = [&](float cardTop, int rowIndex) {
         return bodyTop_ - scrollY_ + px(cardTop + kFirstRowOffset + rowIndex * kRowPitch);
     };
+    // 下拉框：显示当前选中项，展开时高亮
+    const auto drawDropdown = [&](Field field) {
+        const Choice* choice = FindChoice(field);
+        const std::wstring text =
+            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
+                ? choice->items[static_cast<size_t>(choice->selected)]
+                : std::wstring();
+        DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
+    };
 
     // 基础
     const int card1Top = bodyTop_ - scrollY_ + px(kCard1Top);
@@ -735,16 +743,7 @@ void SettingsDialog::Render() {
     DrawLabel({innerLeft, rowTop(kCard1Top, 0), innerLeft + px(kLabelWidth),
                rowTop(kCard1Top, 0) + px(kRowHeight)},
               L"功能栏位置");
-    {
-        const Choice* choice = FindChoice(Field::ToolbarPosition);
-        const RECT rect = FieldRect(Field::ToolbarPosition);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(rect, text, DropdownExpanded(Field::ToolbarPosition),
-                     hover_.field == Field::ToolbarPosition);
-    }
+    drawDropdown(Field::ToolbarPosition);
     DrawLabel({innerLeft, rowTop(kCard1Top, 1), innerLeft + px(kLabelWidth),
                rowTop(kCard1Top, 1) + px(kRowHeight)},
               L"临时文件夹");
@@ -769,41 +768,15 @@ void SettingsDialog::Render() {
     DrawLabel({innerLeft, rowTop(kCard2Top, 0), innerLeft + px(kLabelWidth),
                rowTop(kCard2Top, 0) + px(kRowHeight)},
               L"默认摄像头");
-    {
-        const Choice* choice = FindChoice(Field::Camera);
-        const RECT rect = FieldRect(Field::Camera);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(rect, text, DropdownExpanded(Field::Camera),
-                     hover_.field == Field::Camera);
-    }
+    drawDropdown(Field::Camera);
     DrawLabel({innerLeft, rowTop(kCard2Top, 1), innerLeft + px(kLabelWidth),
                rowTop(kCard2Top, 1) + px(kRowHeight)},
               L"摄像头刷新率");
-    {
-        const Choice* choice = FindChoice(Field::Fps);
-        const RECT rect = FieldRect(Field::Fps);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(rect, text, DropdownExpanded(Field::Fps), hover_.field == Field::Fps);
-    }
+    drawDropdown(Field::Fps);
     DrawLabel({innerLeft, rowTop(kCard2Top, 2), innerLeft + px(kLabelWidth),
                rowTop(kCard2Top, 2) + px(kRowHeight)},
               L"摄像头分辨率");
-    {
-        const Choice* choice = FindChoice(Field::Resolution);
-        const RECT rect = FieldRect(Field::Resolution);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(rect, text, DropdownExpanded(Field::Resolution),
-                     hover_.field == Field::Resolution);
-    }
+    drawDropdown(Field::Resolution);
     DrawLabel({innerLeft, rowTop(kCard2Top, 3), innerLeft + px(kLabelWidth),
                rowTop(kCard2Top, 3) + px(kRowHeight)},
               L"自动曝光");

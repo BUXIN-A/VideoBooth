@@ -32,7 +32,7 @@ public:
     static uint32_t ColorAt(int index);
     static float EraserRadiusAt(int index);
 
-    bool Init(Resources* resources);
+    void Init(Resources* resources);
     void SetScale(float uiScale);
     // toolbarBounds：功能栏矩形；anchorButton：所选模式按钮矩形；vertical：功能栏是否纵向
     void Layout(const RECT& toolbarBounds, const RECT& anchorButton, bool vertical, int windowWidth,
@@ -51,10 +51,8 @@ public:
 
     MorePanelHit HitTest(POINT point) const;
 
-    int colorIndex() const { return colorIndex_; }
     uint32_t color() const { return ColorAt(colorIndex_); }
     int penThickness() const { return penThickness_; }
-    int eraserSizeIndex() const { return eraserSizeIndex_; }
     float eraserRadius() const { return EraserRadiusAt(eraserSizeIndex_); }
 
     void SelectColor(int index);
@@ -85,7 +83,8 @@ private:
     int TabShortSide() const; // 标签垂直功能栏方向的短边
     void ComputeContentLayout(ContentLayout& layout) const;
     void ComputeSliderHandle(ContentLayout& layout) const;
-    int ThicknessFromLocalX(int localX) const;
+    // 滑块横坐标换算为实际粗细值
+    int ThicknessFromLocalX(const RECT& track, int localX) const;
     void RenderTab(OverlayCanvas& canvas, const RECT& rect, int rotateQuarter);
     void RenderPanel(OverlayCanvas& canvas, const ContentLayout& layout);
 

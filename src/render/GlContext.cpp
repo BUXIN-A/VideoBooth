@@ -3,7 +3,6 @@
 #include "util/Log.h"
 #include "util/Strings.h"
 
-#include <cstring>
 #include <vector>
 
 namespace vb {
@@ -322,9 +321,14 @@ void GlContext::Destroy() {
 }
 
 void GlContext::MakeCurrent() {
-    if (context_ != nullptr && dc_ != nullptr) {
-        ::wglMakeCurrent(dc_, context_);
+    if (context_ == nullptr || dc_ == nullptr) {
+        return;
     }
+    // 每帧都会调用：已是当前上下文时直接返回，避免进入驱动的冗余切换
+    if (::wglGetCurrentContext() == context_) {
+        return;
+    }
+    ::wglMakeCurrent(dc_, context_);
 }
 
 void GlContext::Present() {

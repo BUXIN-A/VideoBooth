@@ -1,7 +1,5 @@
 #include "ui/MorePanel.h"
 
-#include "util/Log.h"
-
 #include <algorithm>
 #include <string>
 
@@ -59,9 +57,8 @@ float MorePanel::EraserRadiusAt(int index) {
     return kEraserRadius[index];
 }
 
-bool MorePanel::Init(Resources* resources) {
+void MorePanel::Init(Resources* resources) {
     resources_ = resources;
-    return true;
 }
 
 void MorePanel::SetScale(float uiScale) {
@@ -261,10 +258,7 @@ void MorePanel::ComputeSliderHandle(ContentLayout& layout) const {
                            centerY + radius};
 }
 
-int MorePanel::ThicknessFromLocalX(int localX) const {
-    ContentLayout layout;
-    ComputeContentLayout(layout);
-    const RECT& track = layout.sliderTrack;
+int MorePanel::ThicknessFromLocalX(const RECT& track, int localX) const {
     const int span = static_cast<int>(track.right - track.left);
     if (span <= 0) {
         return penThickness_;
@@ -279,7 +273,9 @@ bool MorePanel::PenSliderFromPoint(POINT point) {
     if (!laidOut_ || !open_ || mode_ == core::ToolMode::Erase) {
         return false;
     }
-    const int value = ThicknessFromLocalX(point.x - screenLeft_);
+    ContentLayout layout;
+    ComputeContentLayout(layout);
+    const int value = ThicknessFromLocalX(layout.sliderTrack, point.x - screenLeft_);
     if (value == penThickness_) {
         return false;
     }
@@ -335,7 +331,7 @@ MorePanelHit MorePanel::HitTest(POINT point) const {
     ::InflateRect(&sliderArea, sliderPadding, sliderPadding);
     if (inside(sliderArea)) {
         hit.kind = MorePanelHit::Kind::PenThickness;
-        hit.index = ThicknessFromLocalX(local.x);
+        hit.index = ThicknessFromLocalX(layout.sliderTrack, local.x);
         return hit;
     }
     return hit;

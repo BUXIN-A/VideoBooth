@@ -4,7 +4,6 @@
 
 #include <cstddef>
 #include <functional>
-#include <string>
 
 #include "ui/OverlayCanvas.h"
 #include "ui/Resources.h"
@@ -25,7 +24,7 @@ public:
     // 缩略图提供者：按索引返回缩略图，未就绪时返回 nullptr
     using ThumbnailProvider = std::function<const img::Image*(size_t index)>;
 
-    bool Init(Resources* resources);
+    void Init(Resources* resources);
     void SetScale(float uiScale);
 
     // 依据功能栏位置与窗口尺寸重算面板几何（照片数量会影响面板宽度）
@@ -35,11 +34,9 @@ public:
     bool isOpen() const { return open_; }
 
     void SetPhotoCount(size_t count);
-    size_t photoCount() const { return photoCount_; }
 
     // 当前正在画面框中展示的照片下标，-1 表示未展示
     void SetShownIndex(long long index) { shownIndex_ = index; }
-    long long shownIndex() const { return shownIndex_; }
 
     // 导出时是否把批注笔迹合成进照片（面板上的选择框）
     void SetComposeAnnotation(bool value) { composeAnnotation_ = value; }
@@ -75,10 +72,13 @@ private:
     int PanelHeight() const;
     int MaxScroll() const;
     RECT ViewportRect() const;
+    // 全部卡片横向排列后的总宽度
+    int ContentWidth() const;
     // 标题行右侧的“导入照片”“保存照片”按钮
     void UpdateHeaderButtons();
     void CardGeometryAt(size_t index, CardGeometry& geometry) const;
-    void RenderCard(const CardGeometry& geometry, size_t index, const ThumbnailProvider& provider);
+    void RenderCard(const CardGeometry& geometry, size_t index, const ThumbnailProvider& provider,
+                    const img::Image* const* buttonIcons);
     void RenderScrollBar();
     void RenderHeaderButton(const RECT& rect, const wchar_t* icon, const wchar_t* fallback,
                             bool hovered);
@@ -89,14 +89,11 @@ private:
     float scale_ = 1.0f;
     bool open_ = false;
 
-    RECT toolbarBounds_ = {0, 0, 0, 0};
     RECT panelRect_ = {0, 0, 0, 0};
     RECT headerImportRect_ = {0, 0, 0, 0};
     RECT headerSaveAllRect_ = {0, 0, 0, 0};
     RECT headerComposeRect_ = {0, 0, 0, 0};     // “合成笔迹”整行点击区（图标 + 文字）
     RECT headerComposeBoxRect_ = {0, 0, 0, 0};  // 选择框图标区域
-    int windowWidth_ = 0;
-    int windowHeight_ = 0;
 
     size_t photoCount_ = 0;
     long long shownIndex_ = -1;

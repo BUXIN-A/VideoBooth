@@ -127,11 +127,6 @@ bool SplashWindow::MinimumElapsed() const {
 }
 
 LRESULT CALLBACK SplashWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    if (message == WM_CREATE) {
-        const auto* create = reinterpret_cast<const CREATESTRUCTW*>(lParam);
-        ::SetWindowLongPtrW(hwnd, GWLP_USERDATA,
-                            reinterpret_cast<LONG_PTR>(create->lpCreateParams));
-    }
     return ::DefWindowProcW(hwnd, message, wParam, lParam);
 }
 

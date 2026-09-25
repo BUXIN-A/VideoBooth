@@ -18,7 +18,6 @@ public:
     void Close();
 
     bool MinimumElapsed() const;
-    HWND Handle() const { return hwnd_; }
 
 private:
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam);

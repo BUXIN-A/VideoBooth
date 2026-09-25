@@ -33,7 +33,6 @@ struct PreviewView {
 // 左下角预览框：显示画面全景，蓝色虚线框表示当前屏幕可见区域，可拖动
 class PreviewPanel {
 public:
-    bool Init();
     void SetScale(float uiScale);
     void Layout(int windowHeight);
     const RECT& bounds() const { return bounds_; }
@@ -58,8 +57,6 @@ private:
     bool dirty_ = true;
     bool validView_ = false;
 
-    // 可见区域（旋转后图像坐标系）
-    RECT visibleInImage_ = {0, 0, 0, 0};
     // 可见区域（预览框画布坐标）
     RECT visibleInPanel_ = {0, 0, 0, 0};
 

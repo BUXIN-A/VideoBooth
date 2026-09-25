@@ -23,7 +23,7 @@ public:
     void ClearDirty() { dirty_ = false; }
 
     // 打开面板：config 为当前配置副本，点击“保存”后结果写入 result()
-    bool Open(HWND owner, const core::AppConfig& config,
+    void Open(HWND owner, const core::AppConfig& config,
               const std::vector<capture::CameraInfo>& cameras, float uiScale, int clientWidth,
               int clientHeight);
     void Close();
@@ -141,7 +141,6 @@ private:
     int originY_ = 0;
     int bodyTop_ = 0;
     int bodyBottom_ = 0;
-    int contentHeight_ = 0;
     int maxScroll_ = 0;
     int scrollY_ = 0;
     RECT closeRect_ = {0, 0, 0, 0};

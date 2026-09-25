@@ -37,6 +37,9 @@ constexpr float kMinPanelWidth = 420.0f;
 // 面板宽度固定为窗口宽度的比例，避免随照片数量改变面板大小
 constexpr float kPanelWidthRatio = 0.6f;
 constexpr float kScreenMargin = 12.0f;
+// 卡片高度：缩略图 + 按钮行 + 上下内边距
+constexpr float kCardHeight =
+    kCardInsetTop + kThumbHeight + kThumbToButtons + kButtonSize + kCardInsetBottom;
 
 constexpr int kButtonCount = 3;
 const wchar_t* const kButtonIcons[kButtonCount] = {L"delete.png", L"save.png", L"show.png"};
@@ -67,9 +70,8 @@ bool RectsOverlap(const RECT& a, const RECT& b) {
 
 } // namespace
 
-bool AlbumPanel::Init(Resources* resources) {
+void AlbumPanel::Init(Resources* resources) {
     resources_ = resources;
-    return true;
 }
 
 void AlbumPanel::SetScale(float uiScale) {
@@ -101,21 +103,16 @@ void AlbumPanel::SetHover(const AlbumPanelHit& hit) {
 }
 
 int AlbumPanel::PanelHeight() const {
-    const float s = scale_;
-    const float cardHeight = kCardInsetTop + kThumbHeight + kThumbToButtons + kButtonSize +
-                             kCardInsetBottom;
-    const float total = kPadding + kTitleHeight + kTitleGap + cardHeight + kBarGap + kBarHeight +
+    const float total = kPadding + kTitleHeight + kTitleGap + kCardHeight + kBarGap + kBarHeight +
                         kPadding;
-    return static_cast<int>(total * s);
+    return static_cast<int>(total * scale_);
 }
 
 RECT AlbumPanel::ViewportRect() const {
     const float s = scale_;
     const int padding = static_cast<int>(kPadding * s);
     const int top = padding + static_cast<int>((kTitleHeight + kTitleGap) * s);
-    const int cardHeight =
-        static_cast<int>((kCardInsetTop + kThumbHeight + kThumbToButtons + kButtonSize +
-                          kCardInsetBottom) * s);
+    const int cardHeight = static_cast<int>(kCardHeight * s);
     const int width = std::max(1, static_cast<int>(panelRect_.right - panelRect_.left) - padding * 2);
     return {padding, top, padding + width, top + cardHeight};
 }
@@ -143,25 +140,26 @@ void AlbumPanel::UpdateHeaderButtons() {
                              top + height};
 }
 
+int AlbumPanel::ContentWidth() const {
+    if (photoCount_ == 0) {
+        return 0;
+    }
+    const int cardWidth = static_cast<int>(kCardWidth * scale_);
+    const int cardGap = static_cast<int>(kCardGap * scale_);
+    return static_cast<int>(photoCount_) * cardWidth +
+           static_cast<int>(photoCount_ - 1) * cardGap;
+}
+
 int AlbumPanel::MaxScroll() const {
     if (photoCount_ == 0) {
         return 0;
     }
-    const float s = scale_;
-    const int cardWidth = static_cast<int>(kCardWidth * s);
-    const int cardGap = static_cast<int>(kCardGap * s);
-    const int contentWidth = static_cast<int>(photoCount_) * cardWidth +
-                             static_cast<int>(photoCount_ - 1) * cardGap;
     const RECT viewport = ViewportRect();
     const int viewportWidth = static_cast<int>(viewport.right - viewport.left);
-    return std::max(0, contentWidth - viewportWidth);
+    return std::max(0, ContentWidth() - viewportWidth);
 }
 
 void AlbumPanel::Layout(const RECT& toolbarBounds, int clientWidth, int clientHeight) {
-    toolbarBounds_ = toolbarBounds;
-    windowWidth_ = clientWidth;
-    windowHeight_ = clientHeight;
-
     const float s = scale_;
     const int minPanelWidth = static_cast<int>(kMinPanelWidth * s);
 
@@ -192,9 +190,6 @@ void AlbumPanel::Layout(const RECT& toolbarBounds, int clientWidth, int clientHe
 
     UpdateHeaderButtons();
     scrollX_ = std::max(0, std::min(scrollX_, MaxScroll()));
-    VB_INFO("相册面板布局: %ld,%ld-%ld,%ld（%zu 张，滚动 %d/%d）", panelRect_.left,
-            panelRect_.top, panelRect_.right, panelRect_.bottom, photoCount_, scrollX_,
-            MaxScroll());
 }
 
 bool AlbumPanel::ContainsPoint(POINT point) const {
@@ -210,18 +205,14 @@ void AlbumPanel::CardGeometryAt(size_t index, CardGeometry& geometry) const {
     const RECT viewport = ViewportRect();
     const int cardWidth = static_cast<int>(kCardWidth * s);
     const int cardGap = static_cast<int>(kCardGap * s);
-    const int contentWidth = static_cast<int>(photoCount_) * cardWidth +
-                             static_cast<int>(photoCount_ - 1) * cardGap;
     const int viewportWidth = viewport.right - viewport.left;
     // 内容不足一屏时居中显示
-    const int offset = std::max(0, (viewportWidth - contentWidth) / 2);
+    const int offset = std::max(0, (viewportWidth - ContentWidth()) / 2);
 
     const int left = viewport.left + offset - scrollX_ +
                      static_cast<int>(index) * (cardWidth + cardGap);
     const int top = viewport.top;
-    const int cardHeight =
-        static_cast<int>((kCardInsetTop + kThumbHeight + kThumbToButtons + kButtonSize +
-                          kCardInsetBottom) * s);
+    const int cardHeight = static_cast<int>(kCardHeight * s);
     geometry.card = {left, top, left + cardWidth, top + cardHeight};
 
     const int insetX = static_cast<int>(kCardInsetX * s);
@@ -274,6 +265,9 @@ AlbumPanelHit AlbumPanel::HitTest(POINT point) const {
     for (size_t i = 0; i < photoCount_; ++i) {
         CardGeometry geometry;
         CardGeometryAt(i, geometry);
+        if (geometry.card.left > localX) {
+            break; // 卡片按横坐标递增排列，后续卡片只会更靠右
+        }
         if (!InsideRect(localX, localY, geometry.card)) {
             continue;
         }
@@ -322,7 +316,8 @@ void AlbumPanel::EndDrag() {
 }
 
 void AlbumPanel::RenderCard(const CardGeometry& geometry, size_t index,
-                            const ThumbnailProvider& provider) {
+                            const ThumbnailProvider& provider,
+                            const img::Image* const* buttonIcons) {
     const float s = scale_;
     const bool shown = static_cast<long long>(index) == shownIndex_;
     const bool thumbHover = hover_.kind == AlbumPanelHit::Kind::Thumbnail && hover_.index == index;
@@ -369,8 +364,7 @@ void AlbumPanel::RenderCard(const CardGeometry& geometry, size_t index,
         const COLORREF background = accent ? kAccentColor : (hovered ? kButtonHover : kButtonColor);
         canvas_.FillRoundRect(button, static_cast<int>(8.0f * s), background, 255);
 
-        const img::Image* icon =
-            resources_ != nullptr ? resources_->Get(kButtonIcons[b]) : nullptr;
+        const img::Image* icon = buttonIcons[b];
         if (icon != nullptr && icon->Valid()) {
             const int centerX = (button.left + button.right) / 2;
             const int centerY = (button.top + button.bottom) / 2;
@@ -502,13 +496,21 @@ void AlbumPanel::Render(const ThumbnailProvider& provider) {
 
     // 滚动视口内裁剪绘制，保证滚出面板的卡片不会溢出
     canvas_.SetClipRect(viewport);
+    // 按钮图标在循环外一次取出，避免每张卡片重复查找资源
+    const img::Image* buttonIcons[kButtonCount] = {};
+    for (int b = 0; b < kButtonCount; ++b) {
+        buttonIcons[b] = resources_ != nullptr ? resources_->Get(kButtonIcons[b]) : nullptr;
+    }
     for (size_t i = 0; i < photoCount_; ++i) {
         CardGeometry geometry;
         CardGeometryAt(i, geometry);
+        if (geometry.card.left >= viewport.right) {
+            break; // 卡片按横坐标递增排列，越过视口右边界后都不可见
+        }
         if (!RectsOverlap(geometry.card, viewport)) {
             continue;
         }
-        RenderCard(geometry, i, provider);
+        RenderCard(geometry, i, provider, buttonIcons);
     }
     canvas_.ResetClip();
 

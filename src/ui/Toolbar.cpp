@@ -1,7 +1,5 @@
 #include "ui/Toolbar.h"
 
-#include "util/Log.h"
-
 #include <algorithm>
 
 namespace vb {
@@ -47,12 +45,11 @@ constexpr COLORREF kActiveLabelColor = RGB(21, 92, 205);
 
 } // namespace
 
-bool Toolbar::Init(Resources* resources, bool vertical) {
+void Toolbar::Init(Resources* resources, bool vertical) {
     resources_ = resources;
     vertical_ = vertical;
     buttonRects_.assign(kToolButtonCount, RECT{0, 0, 0, 0});
     active_.assign(kToolButtonCount, false);
-    return true;
 }
 
 void Toolbar::SetScale(float uiScale) {
@@ -143,13 +140,6 @@ void Toolbar::SetActive(int index, bool active) {
     }
 }
 
-bool Toolbar::isActive(int index) const {
-    if (index < 0 || index >= kToolButtonCount) {
-        return false;
-    }
-    return active_[index];
-}
-
 void Toolbar::SetButtonContent(ToolButtonId id, const wchar_t* icon, const wchar_t* label) {
     const int index = static_cast<int>(id);
     if (index < 0 || index >= kToolButtonCount) {
@@ -219,10 +209,9 @@ void Toolbar::Render(int hoverIndex, int pressedIndex) {
         const img::Image* icon =
             resources_ != nullptr ? resources_->Get(iconName) : nullptr;
         if (icon != nullptr && icon->Valid()) {
-            RECT dest = iconRect;
             const int offsetX = localLeft + (localWidth - iconSize) / 2;
             const int offsetY = localTop + iconTop;
-            dest = {offsetX, offsetY, offsetX + iconSize, offsetY + iconSize};
+            const RECT dest = {offsetX, offsetY, offsetX + iconSize, offsetY + iconSize};
             canvas_.DrawPixels(icon->pixels(), icon->width(), icon->height(), icon->stride(),
                                dest, 0, contentAlpha);
         }

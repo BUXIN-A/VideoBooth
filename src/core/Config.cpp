@@ -14,6 +14,14 @@ namespace vb {
 namespace core {
 namespace {
 
+// 摄像头参数的合法区间（配置读取与界面写入共用同一份边界）
+constexpr int kMinFps = 1;
+constexpr int kMaxFps = 240;
+constexpr int kMinWidth = 160;
+constexpr int kMaxWidth = 7680;
+constexpr int kMinHeight = 120;
+constexpr int kMaxHeight = 4320;
+
 bool ReadAllBytes(const std::wstring& path, std::string& out) {
     out.clear();
     HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ,
@@ -162,6 +170,20 @@ bool ConfigStore::PeekSaveLog(const std::wstring& configPath, bool fallback) {
     return value->AsBool(fallback);
 }
 
+// 解析可用的临时照片目录：目录不可用时回退到系统默认目录并清空配置项。
+// 返回 true 表示发生了回退（配置需要修复后落盘）
+bool ConfigStore::ResolvePhotoDir(std::wstring& photoDir) {
+    photoDir = config_.tempFolder.empty() ? paths::DefaultPhotoDir() : config_.tempFolder;
+    if (paths::EnsureDirectory(photoDir)) {
+        return false;
+    }
+    VB_WARN("临时照片目录不可用（%ls），回退到默认目录", photoDir.c_str());
+    photoDir = paths::DefaultPhotoDir();
+    paths::EnsureDirectory(photoDir);
+    config_.tempFolder.clear();
+    return true;
+}
+
 bool ConfigStore::Load() {
     const std::wstring configPath = paths::ConfigPath();
     const std::wstring backupPath = paths::ConfigBackupPath();
@@ -224,9 +246,9 @@ bool ConfigStore::Load() {
     const json::Value& camera = SubObject(root, "camera", repaired);
     config.camera.defaultCamera =
         Utf8ToWide(StringField(camera, "defaultCamera", "", repaired));
-    config.camera.fps = IntField(camera, "fps", 30, 1, 240, repaired);
-    config.camera.width = IntField(camera, "width", 1920, 160, 7680, repaired);
-    config.camera.height = IntField(camera, "height", 1080, 120, 4320, repaired);
+    config.camera.fps = IntField(camera, "fps", 30, kMinFps, kMaxFps, repaired);
+    config.camera.width = IntField(camera, "width", 1920, kMinWidth, kMaxWidth, repaired);
+    config.camera.height = IntField(camera, "height", 1080, kMinHeight, kMaxHeight, repaired);
     config.camera.autoExposure = BoolField(camera, "autoExposure", false, repaired);
 
     const json::Value& render = SubObject(root, "render", repaired);
@@ -237,15 +259,8 @@ bool ConfigStore::Load() {
     config_ = config;
 
     // 解析临时照片目录：配置不可用时回退到默认目录
-    std::wstring photoDir = config_.tempFolder;
-    if (photoDir.empty()) {
-        photoDir = paths::DefaultPhotoDir();
-    }
-    if (!paths::EnsureDirectory(photoDir)) {
-        VB_WARN("临时照片目录不可用（%ls），回退到默认目录", photoDir.c_str());
-        photoDir = paths::DefaultPhotoDir();
-        paths::EnsureDirectory(photoDir);
-        config_.tempFolder.clear();
+    std::wstring photoDir;
+    if (ResolvePhotoDir(photoDir)) {
         repaired = true;
     }
     photoDir_ = photoDir;
@@ -291,18 +306,12 @@ bool ConfigStore::Apply(const AppConfig& config) {
     if (config_.toolbarPosition != "bottom" && config_.toolbarPosition != "sides") {
         config_.toolbarPosition = "bottom";
     }
-    config_.camera.fps = std::max(1, std::min(240, config_.camera.fps));
-    config_.camera.width = std::max(160, std::min(7680, config_.camera.width));
-    config_.camera.height = std::max(120, std::min(4320, config_.camera.height));
+    config_.camera.fps = std::max(kMinFps, std::min(kMaxFps, config_.camera.fps));
+    config_.camera.width = std::max(kMinWidth, std::min(kMaxWidth, config_.camera.width));
+    config_.camera.height = std::max(kMinHeight, std::min(kMaxHeight, config_.camera.height));
 
-    std::wstring photoDir =
-        config_.tempFolder.empty() ? paths::DefaultPhotoDir() : config_.tempFolder;
-    if (!paths::EnsureDirectory(photoDir)) {
-        VB_WARN("临时照片目录不可用（%ls），回退到默认目录", photoDir.c_str());
-        photoDir = paths::DefaultPhotoDir();
-        paths::EnsureDirectory(photoDir);
-        config_.tempFolder.clear();
-    }
+    std::wstring photoDir;
+    ResolvePhotoDir(photoDir);
     photoDir_ = photoDir;
 
     VB_INFO("设置已写入: 摄像头=%ls, %dx%d@%dfps, 自动曝光=%d, 功能栏=%s, 垂直同步=%d, "

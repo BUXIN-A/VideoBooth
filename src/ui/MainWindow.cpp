@@ -4,7 +4,6 @@
 #include "core/Paths.h"
 #include "resource.h"
 #include "ui/FileDialog.h"
-#include "ui/SettingsDialog.h"
 #include "util/Image.h"
 #include "util/Log.h"
 #include "util/Strings.h"
@@ -78,6 +77,16 @@ bool IsTouchSynthesizedMouseMessage(UINT message) {
     constexpr unsigned long long kTouchSignature = 0xFF515700ull;
     const unsigned long long extra = static_cast<unsigned long long>(::GetMessageExtraInfo());
     return (extra & kSignatureMask) == kTouchSignature && (extra & 0x80ull) != 0;
+}
+
+// 批量导入/保存的统一进度提示：全部成功时只报总数
+std::wstring BatchResultText(const wchar_t* verb, size_t done, size_t total) {
+    const unsigned long long doneCount = static_cast<unsigned long long>(done);
+    if (done == total) {
+        return FormatW(L"已%s %llu 张照片", verb, doneCount);
+    }
+    return FormatW(L"已%s %llu/%llu 张照片", verb, doneCount,
+                   static_cast<unsigned long long>(total));
 }
 
 // 导入的图片统一转存为 JPG（相册只收录 IMG_*.jpg）；.jpg/.jpeg 直接复制避免二次压缩
@@ -178,7 +187,6 @@ bool MainWindow::Create(HINSTANCE instance, const MainWindowDeps& deps) {
 
     toolbar_.Init(deps_.resources, deps_.configStore->Get().IsToolbarVertical());
     toolbar_.SetScale(uiScale_);
-    preview_.Init();
     preview_.SetScale(uiScale_);
     morePanel_.Init(deps_.resources);
     morePanel_.SetScale(uiScale_);
@@ -1091,9 +1099,6 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
                 WindowToImage(x, y, &imageX, &imageY);
                 annotation_.PointerDown(imageX, imageY, state_.tool == core::ToolMode::Erase);
                 annotating_ = true;
-                VB_INFO("%s 开始: 窗口(%d,%d) → 图像(%.1f,%.1f)",
-                        state_.tool == core::ToolMode::Erase ? "擦除" : "批注", x, y, imageX,
-                        imageY);
             } else {
                 VB_WARN("批注被忽略: 画面可交互=%d, 批注层有效=%d",
                         state_.pictureAnnotatable() ? 1 : 0, annotation_.valid() ? 1 : 0);
@@ -1142,9 +1147,6 @@ void MainWindow::OnButtonUp(int x, int y) {
     if (annotating_) {
         annotation_.PointerUp();
         annotating_ = false;
-        VB_INFO("笔画结束: 层版本=%llu, 是否为空=%d",
-                static_cast<unsigned long long>(annotation_.version()),
-                annotation_.empty() ? 1 : 0);
         return;
     }
 
@@ -1241,10 +1243,6 @@ bool MainWindow::HandlePointerMessage(UINT message, WPARAM wParam) {
     }
     if (info.pointerType != PT_TOUCH) {
         // 笔/鼠标指针交默认处理（仍需系统合成为鼠标消息才能正常使用）
-        if (message == WM_POINTERDOWN) {
-            VB_INFO("非触摸指针被忽略: id=%u, type=%d", pointerId,
-                    static_cast<int>(info.pointerType));
-        }
         return false;
     }
     POINT point = info.ptPixelLocation; // 屏幕物理像素
@@ -1262,7 +1260,6 @@ bool MainWindow::HandlePointerMessage(UINT message, WPARAM wParam) {
         if (it != touchContacts_.end()) {
             touchContacts_.erase(it);
             changed = true;
-            VB_INFO("触摸抬起: id=%u, 剩余 %zu 指", pointerId, touchContacts_.size());
         }
     } else if (message == WM_POINTERDOWN || message == WM_POINTERUPDATE) {
         if (it != touchContacts_.end()) {
@@ -1276,7 +1273,6 @@ bool MainWindow::HandlePointerMessage(UINT message, WPARAM wParam) {
             contact.pos = point;
             touchContacts_.push_back(contact);
             changed = true;
-            VB_INFO("触摸按下: id=%u, 当前 %zu 指", pointerId, touchContacts_.size());
         }
     }
     if (changed) {
@@ -1317,9 +1313,6 @@ void MainWindow::UpdateTouchGesture() {
     if (count == 0) {
         // 全部抬起：收尾单指动作或结束多指手势
         if (touchMultiActive_) {
-            // 诊断：本次手势是否真的执行了平移
-            VB_INFO("触摸手势结束: 峰值 %d 指, 平移 %.0f,%.0f px（%d 次更新）",
-                    touchGestureMaxCount_, touchPanX_, touchPanY_, touchPanUpdates_);
             touchMultiActive_ = false;
         } else if (touchSingleActive_) {
             touchSingleActive_ = false;
@@ -1357,27 +1350,17 @@ void MainWindow::UpdateTouchGesture() {
         touchMultiActive_ = true;
         touchModeCount_ = static_cast<int>(count);
         touchGestureMaxCount_ = static_cast<int>(count);
-        touchPanUpdates_ = 0;
-        touchPanX_ = 0.0f;
-        touchPanY_ = 0.0f;
         touchLastDistance_ = TouchDistance();
         touchLastCentroid_ = TouchCentroid();
-        VB_INFO("触摸手势开始：%zu 指", count);
         return;
     }
 
     if (static_cast<int>(count) != touchModeCount_) {
-        // 手指数变化（如抬起一指或接触抖动）：只重置基准，避免画面跳变
+        // 手指数变化（如抬起一指）：只重置基准，避免画面跳变
         touchModeCount_ = static_cast<int>(count);
-        if (touchModeCount_ > touchGestureMaxCount_) {
-            touchGestureMaxCount_ = touchModeCount_;
-            if (touchGestureMaxCount_ >= 3) {
-                VB_INFO("触摸手势切换为多指拖动（%d 指）", touchGestureMaxCount_);
-            }
-        }
+        touchGestureMaxCount_ = std::max(touchGestureMaxCount_, touchModeCount_);
         touchLastDistance_ = TouchDistance();
         touchLastCentroid_ = TouchCentroid();
-        VB_INFO("触摸手指数变化: %zu 指（峰值 %d）", count, touchGestureMaxCount_);
         return;
     }
 
@@ -1386,35 +1369,26 @@ void MainWindow::UpdateTouchGesture() {
         return;
     }
 
+    const POINT centroid = TouchCentroid();
+    const float distance = TouchDistance();
     if (touchGestureMaxCount_ >= 3) {
         // 三指及以上：平移画面（本次手势已确认为拖动，抬起一指后仍继续平移）
-        const POINT centroid = TouchCentroid();
         const int deltaX = centroid.x - touchLastCentroid_.x;
         const int deltaY = centroid.y - touchLastCentroid_.y;
         if (deltaX != 0 || deltaY != 0) {
             state_.offsetX += static_cast<float>(deltaX);
             state_.offsetY += static_cast<float>(deltaY);
             ClampOffsets();
-            ++touchPanUpdates_;
-            touchPanX_ += static_cast<float>(deltaX);
-            touchPanY_ += static_cast<float>(deltaY);
         }
-        touchLastCentroid_ = centroid;
-        touchLastDistance_ = TouchDistance();
-        return;
-    }
-
-    // 双指捏合：按两指距离变化比例缩放，锚点为两指中心
-    const float distance = TouchDistance();
-    if (touchLastDistance_ > 1.0f && distance > 1.0f) {
+    } else if (touchLastDistance_ > 1.0f && distance > 1.0f) {
+        // 双指捏合：按两指距离变化比例缩放，锚点为两指中心
         const float factor = distance / touchLastDistance_;
         if (factor > 0.0f && factor < 100.0f) {
-            const POINT centroid = TouchCentroid();
             ApplyZoomAt(centroid.x, centroid.y, factor);
         }
     }
     touchLastDistance_ = distance;
-    touchLastCentroid_ = TouchCentroid();
+    touchLastCentroid_ = centroid;
 }
 
 void MainWindow::OnKeyDown(UINT key) {
@@ -1969,11 +1943,7 @@ void MainWindow::SaveAllAlbumPhotos() {
     const bool withAnnotation = albumPanel_.composeAnnotation();
     const size_t total = photoLibrary_.size();
     const size_t saved = ExportAlbumPhotosTo(folder, withAnnotation);
-    ShowToast(saved == total
-                  ? FormatW(L"已保存 %llu 张照片", static_cast<unsigned long long>(saved))
-                  : FormatW(L"已保存 %llu/%llu 张照片",
-                            static_cast<unsigned long long>(saved),
-                            static_cast<unsigned long long>(total)));
+    ShowToast(BatchResultText(L"保存", saved, total));
 }
 
 void MainWindow::ImportAlbumPhotos() {
@@ -1990,11 +1960,7 @@ void MainWindow::ImportAlbumPhotos() {
         ShowToast(L"照片导入失败");
         return;
     }
-    ShowToast(imported == total
-                  ? FormatW(L"已导入 %llu 张照片", static_cast<unsigned long long>(imported))
-                  : FormatW(L"已导入 %llu/%llu 张照片",
-                            static_cast<unsigned long long>(imported),
-                            static_cast<unsigned long long>(total)));
+    ShowToast(BatchResultText(L"导入", imported, total));
 }
 
 void MainWindow::DeleteAlbumPhoto(size_t index) {

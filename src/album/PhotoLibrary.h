@@ -29,7 +29,6 @@ public:
     static constexpr int kThumbnailMaxEdge = 256;
 
     void SetDirectory(const std::wstring& directory) { directory_ = directory; }
-    const std::wstring& directory() const { return directory_; }
 
     // 重新扫描目录，按拍摄时间倒序排列（最新在前），并释放旧缓存
     void Refresh();

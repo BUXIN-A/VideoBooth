@@ -186,17 +186,6 @@ void OverlayCanvas::FillSpan(int x0, int x1, int y, COLORREF color, BYTE alpha) 
     }
 }
 
-void OverlayCanvas::BlendPixel(int x, int y, float red, float green, float blue, float alpha) {
-    if (!valid() || x < 0 || x >= width_ || y < 0 || y >= height_ || alpha <= 0.0f) {
-        return;
-    }
-    if (clipEnabled_ &&
-        (x < clip_.left || x >= clip_.right || y < clip_.top || y >= clip_.bottom)) {
-        return;
-    }
-    BlendPremultiplied(At(x, y), red, green, blue, alpha);
-}
-
 void OverlayCanvas::FillRect(const RECT& rect, COLORREF color, BYTE alpha) {
     if (!valid()) {
         return;
@@ -260,21 +249,30 @@ void OverlayCanvas::DrawPixels(const uint8_t* bgra, int sourceWidth, int sourceH
     }
 
     const float globalAlpha = ChannelFloat(alpha);
-    for (int y = 0; y < destHeight; ++y) {
-        const int canvasY = static_cast<int>(dest.top) + y;
-        const float v0 = static_cast<float>(y) / destHeight;
-        const float v1 = static_cast<float>(y + 1) / destHeight;
-        for (int x = 0; x < destWidth; ++x) {
-            const int canvasX = static_cast<int>(dest.left) + x;
-            if (canvasX < 0 || canvasX >= width_ || canvasY < 0 || canvasY >= height_) {
+    const float inverseWidth = 1.0f / static_cast<float>(destWidth);
+    const float inverseHeight = 1.0f / static_cast<float>(destHeight);
+    const int destLeft = static_cast<int>(dest.left);
+    const int destTop = static_cast<int>(dest.top);
+    // 预先收敛到画布内的像素范围，避免逐像素做边界判断
+    const int xStart = std::max(0, -destLeft);
+    const int xEnd = std::min(destWidth, width_ - destLeft);
+    const int yStart = std::max(0, -destTop);
+    const int yEnd = std::min(destHeight, height_ - destTop);
+    for (int y = yStart; y < yEnd; ++y) {
+        const int canvasY = destTop + y;
+        if (clipEnabled_ && (canvasY < clip_.top || canvasY >= clip_.bottom)) {
+            continue;
+        }
+        uint8_t* canvasRow = bits_ + static_cast<ptrdiff_t>(canvasY) * stride_;
+        const float v0 = static_cast<float>(y) * inverseHeight;
+        const float v1 = static_cast<float>(y + 1) * inverseHeight;
+        for (int x = xStart; x < xEnd; ++x) {
+            const int canvasX = destLeft + x;
+            if (clipEnabled_ && (canvasX < clip_.left || canvasX >= clip_.right)) {
                 continue;
             }
-            if (clipEnabled_ && (canvasX < clip_.left || canvasX >= clip_.right ||
-                                 canvasY < clip_.top || canvasY >= clip_.bottom)) {
-                continue;
-            }
-            const float u0 = static_cast<float>(x) / destWidth;
-            const float u1 = static_cast<float>(x + 1) / destWidth;
+            const float u0 = static_cast<float>(x) * inverseWidth;
+            const float u1 = static_cast<float>(x + 1) * inverseWidth;
 
             // 目的像素在源图中的覆盖区域（旋转后仍为轴对齐矩形）
             float sx0 = 0.0f;
@@ -341,8 +339,9 @@ void OverlayCanvas::DrawPixels(const uint8_t* bgra, int sourceWidth, int sourceH
             }
             const float inverse = 1.0f / static_cast<float>(samples);
             // 预乘数据按通道平均后可直接混合
-            BlendPremultipliedFloats(At(canvasX, canvasY), sumB * inverse, sumG * inverse,
-                                     sumR * inverse, sumA * inverse, globalAlpha);
+            BlendPremultipliedFloats(canvasRow + static_cast<ptrdiff_t>(canvasX) * 4,
+                                     sumB * inverse, sumG * inverse, sumR * inverse,
+                                     sumA * inverse, globalAlpha);
         }
     }
 }
@@ -482,23 +481,31 @@ void OverlayCanvas::DrawText(const std::wstring& text, const RECT& box, int font
     const float g = ChannelFloat(GetGValue(color));
     const float b = ChannelFloat(GetBValue(color));
     const float baseAlpha = ChannelFloat(alpha);
-    for (int y = 0; y < boxHeight; ++y) {
-        const int canvasY = static_cast<int>(box.top) + y;
-        if (canvasY < 0 || canvasY >= height_) {
+    // 预先收敛到画布内的采样范围，避免逐像素做边界判断
+    const int boxLeft = static_cast<int>(box.left);
+    const int boxTop = static_cast<int>(box.top);
+    const int xStart = std::max(0, -boxLeft);
+    const int xEnd = std::min(boxWidth, width_ - boxLeft);
+    const int yStart = std::max(0, -boxTop);
+    const int yEnd = std::min(boxHeight, height_ - boxTop);
+    for (int y = yStart; y < yEnd; ++y) {
+        const int canvasY = boxTop + y;
+        if (clipEnabled_ && (canvasY < clip_.top || canvasY >= clip_.bottom)) {
             continue;
         }
         const uint8_t* maskRow = maskBits_ + static_cast<ptrdiff_t>(y) * maskStride_;
-        for (int x = 0; x < boxWidth; ++x) {
-            const int canvasX = static_cast<int>(box.left) + x;
-            if (canvasX < 0 || canvasX >= width_) {
+        uint8_t* canvasRow = bits_ + static_cast<ptrdiff_t>(canvasY) * stride_;
+        for (int x = xStart; x < xEnd; ++x) {
+            const int canvasX = boxLeft + x;
+            if (clipEnabled_ && (canvasX < clip_.left || canvasX >= clip_.right)) {
                 continue;
             }
             const uint8_t coverage = maskRow[x * 4];
             if (coverage == 0) {
                 continue;
             }
-            BlendPixel(canvasX, canvasY, r, g, b,
-                       baseAlpha * ChannelFloat(coverage));
+            BlendPremultiplied(canvasRow + static_cast<ptrdiff_t>(canvasX) * 4, r, g, b,
+                               baseAlpha * ChannelFloat(coverage));
         }
     }
 }

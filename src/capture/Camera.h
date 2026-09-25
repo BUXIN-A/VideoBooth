@@ -96,6 +96,9 @@ private:
 
     // 仅采集线程访问
     IMFSourceReader* reader_ = nullptr;
+    // 协商后的采集分辨率，采集循环按此尺寸打包帧（避免每帧查询媒体类型）
+    int frameWidth_ = 0;
+    int frameHeight_ = 0;
     // 受 sourceMutex_ 保护：关闭流程可能从界面线程调用 Shutdown 以取消阻塞的读取
     std::mutex sourceMutex_;
     IMFMediaSource* source_ = nullptr;

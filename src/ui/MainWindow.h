@@ -211,9 +211,6 @@ private:
     float touchLastDistance_ = 0.0f;   // 双指距离基准
     POINT touchLastCentroid_ = {0, 0}; // 手势中心基准
     POINT touchSinglePos_ = {0, 0};
-    int touchPanUpdates_ = 0;   // 本次手势应用平移的次数（诊断）
-    float touchPanX_ = 0.0f;    // 本次手势累计平移量（诊断）
-    float touchPanY_ = 0.0f;
 
     // 后台 JPG 保存线程（拍照等整帧编码不再阻塞界面）
     img::JpegSaveQueue saveQueue_;

@@ -52,7 +52,11 @@ void WriteLine(LogLevel level, const std::wstring& text) {
     ::swprintf_s(head, L"[%02u:%02u:%02u.%03u][%hs] ",
                  st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, LevelTag(level));
 
-    const std::wstring line = std::wstring(head) + text + L"\r\n";
+    std::wstring line;
+    line.reserve(64 + text.size());
+    line.append(head);
+    line.append(text);
+    line.append(L"\r\n");
     ::OutputDebugStringW(line.c_str());
 
     std::lock_guard<std::mutex> lock(g_mutex);
@@ -62,7 +66,10 @@ void WriteLine(LogLevel level, const std::wstring& text) {
     const std::string utf8 = WideToUtf8(line);
     if (!utf8.empty()) {
         std::fwrite(utf8.data(), 1, utf8.size(), g_file);
-        std::fflush(g_file);
+        // 仅错误级立即落盘：逐行同步会明显拖慢密集的调试日志
+        if (level == LogLevel::Error) {
+            std::fflush(g_file);
+        }
     }
 }
 
@@ -115,13 +122,22 @@ void LogWrite(LogLevel level, const char* format, ...) {
     const int needed = ::_vscprintf(format, argsCopy);
     va_end(argsCopy);
 
-    std::vector<char> buffer(needed > 0 ? static_cast<size_t>(needed) + 1 : 1, '\0');
+    // 常见日志在栈上格式化，仅在超长时回退到堆缓冲
+    char stack[1024] = {};
+    std::vector<char> heap;
+    char* buffer = stack;
+    size_t capacity = sizeof(stack);
+    if (needed > 0 && static_cast<size_t>(needed) + 1 > capacity) {
+        heap.resize(static_cast<size_t>(needed) + 1);
+        buffer = heap.data();
+        capacity = heap.size();
+    }
     if (needed > 0) {
-        ::vsnprintf_s(buffer.data(), buffer.size(), _TRUNCATE, format, args);
+        ::vsnprintf_s(buffer, capacity, _TRUNCATE, format, args);
     }
     va_end(args);
 
-    WriteLine(level, Utf8ToWide(std::string(buffer.data())));
+    WriteLine(level, Utf8ToWide(std::string(buffer)));
 }
 
 void LogWriteW(LogLevel level, const wchar_t* format, ...) {
@@ -135,13 +151,22 @@ void LogWriteW(LogLevel level, const wchar_t* format, ...) {
     const int needed = ::_vscwprintf(format, argsCopy);
     va_end(argsCopy);
 
-    std::vector<wchar_t> buffer(needed > 0 ? static_cast<size_t>(needed) + 1 : 1, L'\0');
+    // 常见日志在栈上格式化，仅在超长时回退到堆缓冲
+    wchar_t stack[1024] = {};
+    std::vector<wchar_t> heap;
+    wchar_t* buffer = stack;
+    size_t capacity = sizeof(stack) / sizeof(stack[0]);
+    if (needed > 0 && static_cast<size_t>(needed) + 1 > capacity) {
+        heap.resize(static_cast<size_t>(needed) + 1);
+        buffer = heap.data();
+        capacity = heap.size();
+    }
     if (needed > 0) {
-        ::vswprintf_s(buffer.data(), buffer.size(), format, args);
+        ::vswprintf_s(buffer, capacity, format, args);
     }
     va_end(args);
 
-    WriteLine(level, std::wstring(buffer.data()));
+    WriteLine(level, std::wstring(buffer));
 }
 
 } // namespace vb

@@ -196,35 +196,42 @@ void StrokeLayer::Stamp(float x, float y, float radius, bool erase) {
 
 void StrokeLayer::BlendCircle(float centerX, float centerY, float radius) {
     const float alpha = ChannelOf(color_, 24);
-    const float red = ChannelOf(color_, 16);
-    const float green = ChannelOf(color_, 8);
-    const float blue = ChannelOf(color_, 0);
+    // 颜色分量预先放大到 0-255，避免在内层逐像素重复乘法
+    const float red = ChannelOf(color_, 16) * 255.0f;
+    const float green = ChannelOf(color_, 8) * 255.0f;
+    const float blue = ChannelOf(color_, 0) * 255.0f;
 
     const int left = static_cast<int>(std::floor(centerX - radius - 1.0f));
     const int top = static_cast<int>(std::floor(centerY - radius - 1.0f));
     const int right = static_cast<int>(std::ceil(centerX + radius + 1.0f));
     const int bottom = static_cast<int>(std::ceil(centerY + radius + 1.0f));
 
-    for (int y = std::max(0, top); y < std::min(height_, bottom); ++y) {
+    const int xStart = std::max(0, left);
+    const int xEnd = std::min(width_, right);
+    const int yStart = std::max(0, top);
+    const int yEnd = std::min(height_, bottom);
+    const float outer = radius + 0.5f;
+    const float outerSquared = outer * outer;
+
+    for (int y = yStart; y < yEnd; ++y) {
         uint8_t* row = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
         const float deltaY = static_cast<float>(y) + 0.5f - centerY;
-        for (int x = std::max(0, left); x < std::min(width_, right); ++x) {
+        const float deltaYSquared = deltaY * deltaY;
+        for (int x = xStart; x < xEnd; ++x) {
             const float deltaX = static_cast<float>(x) + 0.5f - centerX;
-            const float distance = std::sqrt(deltaX * deltaX + deltaY * deltaY);
-            float coverage = radius + 0.5f - distance;
-            if (coverage <= 0.0f) {
-                continue;
+            const float distanceSquared = deltaX * deltaX + deltaYSquared;
+            if (distanceSquared >= outerSquared) {
+                continue; // 圆外像素直接跳过，省去开方
             }
-            coverage = std::min(1.0f, coverage);
-            const float sourceAlpha = alpha * coverage;
+            const float sourceAlpha = alpha * std::min(1.0f, outer - std::sqrt(distanceSquared));
             const float inverse = 1.0f - sourceAlpha;
             uint8_t* pixel = row + static_cast<ptrdiff_t>(x) * 4;
             pixel[0] = static_cast<uint8_t>(
-                std::min(255.0f, blue * 255.0f * sourceAlpha + pixel[0] * inverse + 0.5f));
+                std::min(255.0f, blue * sourceAlpha + pixel[0] * inverse + 0.5f));
             pixel[1] = static_cast<uint8_t>(
-                std::min(255.0f, green * 255.0f * sourceAlpha + pixel[1] * inverse + 0.5f));
+                std::min(255.0f, green * sourceAlpha + pixel[1] * inverse + 0.5f));
             pixel[2] = static_cast<uint8_t>(
-                std::min(255.0f, red * 255.0f * sourceAlpha + pixel[2] * inverse + 0.5f));
+                std::min(255.0f, red * sourceAlpha + pixel[2] * inverse + 0.5f));
             pixel[3] = static_cast<uint8_t>(
                 std::min(255.0f, sourceAlpha * 255.0f + pixel[3] * inverse + 0.5f));
         }
@@ -239,18 +246,24 @@ void StrokeLayer::EraseCircle(float centerX, float centerY, float radius) {
     const int right = static_cast<int>(std::ceil(centerX + radius + 1.0f));
     const int bottom = static_cast<int>(std::ceil(centerY + radius + 1.0f));
 
-    for (int y = std::max(0, top); y < std::min(height_, bottom); ++y) {
+    const int xStart = std::max(0, left);
+    const int xEnd = std::min(width_, right);
+    const int yStart = std::max(0, top);
+    const int yEnd = std::min(height_, bottom);
+    const float outer = radius + 0.5f;
+    const float outerSquared = outer * outer;
+
+    for (int y = yStart; y < yEnd; ++y) {
         uint8_t* row = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
         const float deltaY = static_cast<float>(y) + 0.5f - centerY;
-        for (int x = std::max(0, left); x < std::min(width_, right); ++x) {
+        const float deltaYSquared = deltaY * deltaY;
+        for (int x = xStart; x < xEnd; ++x) {
             const float deltaX = static_cast<float>(x) + 0.5f - centerX;
-            const float distance = std::sqrt(deltaX * deltaX + deltaY * deltaY);
-            float coverage = radius + 0.5f - distance;
-            if (coverage <= 0.0f) {
-                continue;
+            const float distanceSquared = deltaX * deltaX + deltaYSquared;
+            if (distanceSquared >= outerSquared) {
+                continue; // 圆外像素直接跳过，省去开方
             }
-            coverage = std::min(1.0f, coverage);
-            const float keep = 1.0f - coverage;
+            const float keep = 1.0f - std::min(1.0f, outer - std::sqrt(distanceSquared));
             uint8_t* pixel = row + static_cast<ptrdiff_t>(x) * 4;
             pixel[0] = static_cast<uint8_t>(pixel[0] * keep + 0.5f);
             pixel[1] = static_cast<uint8_t>(pixel[1] * keep + 0.5f);
@@ -266,6 +279,7 @@ void StrokeLayer::Composite(uint8_t* target, int targetStride) const {
     if (!valid() || target == nullptr || targetStride <= 0) {
         return;
     }
+    constexpr float kInverse255 = 1.0f / 255.0f;
     for (int y = 0; y < height_; ++y) {
         const uint8_t* source = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
         uint8_t* destination = target + static_cast<ptrdiff_t>(y) * targetStride;
@@ -274,7 +288,7 @@ void StrokeLayer::Composite(uint8_t* target, int targetStride) const {
             if (sourceAlpha == 0) {
                 continue;
             }
-            const float inverse = 1.0f - static_cast<float>(sourceAlpha) / 255.0f;
+            const float inverse = 1.0f - static_cast<float>(sourceAlpha) * kInverse255;
             uint8_t* pixel = destination + static_cast<ptrdiff_t>(x) * 4;
             pixel[0] = static_cast<uint8_t>(
                 std::min(255.0f, source[x * 4 + 0] + pixel[0] * inverse + 0.5f));

@@ -13,7 +13,6 @@ namespace core {
 namespace {
 
 constexpr wchar_t kSingleInstanceMutex[] = L"Global\\VideoBooth.SingleInstance.v1";
-// 正常启动时启动画面固定展示 3 秒后再进入主界面
 constexpr int kSplashMinimumDurationMs = 3000;
 
 } // namespace
@@ -45,7 +44,6 @@ int App::Run(HINSTANCE instance) {
         return 0;
     }
 
-    // 启动画面
     splash_.Create(instance_, paths::AssetPath(L"logo.png"), kSplashMinimumDurationMs);
     PumpMessages();
 
@@ -54,10 +52,8 @@ int App::Run(HINSTANCE instance) {
     LogSetFileEnabled(config_.Get().saveLog);
     LoadAssets();
 
-    // 摄像头检测与选择
     DetectAndOpenCamera();
 
-    // 等待启动画面展示完毕
     while (!splash_.MinimumElapsed()) {
         PumpMessages();
         ::Sleep(10);

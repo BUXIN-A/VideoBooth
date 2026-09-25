@@ -45,7 +45,6 @@ public:
     bool Save();
 
     const AppConfig& Get() const { return config_; }
-    AppConfig& Mutable() { return config_; }
 
     // 应用界面修改后的配置：校正取值范围、重算临时目录并落盘
     bool Apply(const AppConfig& config);
@@ -57,6 +56,9 @@ public:
     const std::wstring& PhotoDir() const { return photoDir_; }
 
 private:
+    // 解析临时照片目录，必要时回退到默认目录（返回是否需要修复配置）
+    bool ResolvePhotoDir(std::wstring& photoDir);
+
     AppConfig config_;
     std::wstring photoDir_;
 };

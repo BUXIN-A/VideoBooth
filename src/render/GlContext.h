@@ -47,7 +47,6 @@ typedef BOOL(WINAPI* PFNWGLCHOOSEPIXELFORMATARBPROC)(HDC, const int*, const FLOA
                                                     int*, UINT*);
 typedef HGLRC(WINAPI* PFNWGLCREATECONTEXTATTRIBSARBPROC)(HDC, HGLRC, const int*);
 typedef BOOL(WINAPI* PFNWGLSWAPINTERVALEXTPROC)(int);
-typedef const char*(WINAPI* PFNWGLGETEXTENSIONSSTRINGARBPROC)(HDC);
 
 namespace vb {
 namespace gfx {
@@ -126,12 +125,8 @@ public:
     void Present();
     // 垂直同步可运行期切换（双缓冲需重建窗口，只能重启生效）
     void SetVsync(bool enabled);
-    bool vsync() const { return vsync_; }
 
     bool IsValid() const { return context_ != nullptr; }
-    // 实际生效的 MSAA 采样数（0 表示未启用）
-    int sampleCount() const { return sampleCount_; }
-    const std::string& rendererInfo() const { return rendererInfo_; }
 
 private:
     HWND hwnd_ = nullptr;
