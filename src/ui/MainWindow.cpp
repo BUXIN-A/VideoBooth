@@ -60,6 +60,26 @@ std::wstring UniqueTargetPath(const std::wstring& path) {
     return path;
 }
 
+// 触摸被系统合成为鼠标消息时会带触摸签名（0xFF515700，bit7 置位表示触摸源）。
+// 触摸统一由 WM_POINTER 处理，这里过滤掉合成消息，避免一次触摸被响应两次。
+bool IsTouchSynthesizedMouseMessage(UINT message) {
+    switch (message) {
+    case WM_MOUSEMOVE:
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_LBUTTONDBLCLK:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+        break;
+    default:
+        return false;
+    }
+    constexpr unsigned long long kSignatureMask = 0xFFFFFF00ull;
+    constexpr unsigned long long kTouchSignature = 0xFF515700ull;
+    const unsigned long long extra = static_cast<unsigned long long>(::GetMessageExtraInfo());
+    return (extra & kSignatureMask) == kTouchSignature && (extra & 0x80ull) != 0;
+}
+
 // 导入的图片统一转存为 JPG（相册只收录 IMG_*.jpg）；.jpg/.jpeg 直接复制避免二次压缩
 bool ImportPhotoFile(const std::wstring& source, const std::wstring& directory) {
     SYSTEMTIME time = {};
@@ -184,6 +204,8 @@ bool MainWindow::Create(HINSTANCE instance, const MainWindowDeps& deps) {
     SyncToolbarState();
     ShowToast(L"正在初始化画面…");
 
+    saveQueue_.Start(); // 后台 JPG 保存线程
+
     ::ShowWindow(hwnd_, SW_SHOW);
     ::SetForegroundWindow(hwnd_);
     ::SetTimer(hwnd_, kRenderTimer, kRenderTimerIntervalMs, nullptr);
@@ -193,6 +215,7 @@ bool MainWindow::Create(HINSTANCE instance, const MainWindowDeps& deps) {
 void MainWindow::Destroy() {
     if (hwnd_ != nullptr) {
         ::KillTimer(hwnd_, kRenderTimer);
+        saveQueue_.Stop(); // 等待已提交的 JPG 保存完成，避免残留半写文件
         if (gl_.IsValid()) {
             gl_.MakeCurrent();
             pictureTexture_.Destroy();
@@ -248,6 +271,10 @@ LRESULT CALLBACK MainWindow::WndProc(HWND hwnd, UINT message, WPARAM wParam, LPA
 }
 
 LRESULT MainWindow::OnMessage(UINT message, WPARAM wParam, LPARAM lParam) {
+    // 触摸已被系统合成为鼠标消息时直接忽略：触摸统一由 WM_POINTER 处理
+    if (IsTouchSynthesizedMouseMessage(message)) {
+        return 0;
+    }
     switch (message) {
     case WM_ERASEBKGND:
         return 1;
@@ -274,12 +301,7 @@ LRESULT MainWindow::OnMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         return 0;
     case WM_MOUSEMOVE: {
-        const POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-        if (settingsDialog_.isOpen()) {
-            settingsDialog_.OnMouseMove(point);
-            return 0;
-        }
-        OnMouseMove(point.x, point.y);
+        DispatchPointerMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
         return 0;
     }
     case WM_MOUSELEAVE:
@@ -290,33 +312,27 @@ LRESULT MainWindow::OnMessage(UINT message, WPARAM wParam, LPARAM lParam) {
         }
         OnMouseLeave();
         return 0;
-    case WM_LBUTTONDOWN:
-        if (settingsDialog_.isOpen()) {
-            const POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            settingsDialog_.OnMouseDown(point);
+    case WM_POINTERDOWN:
+    case WM_POINTERUPDATE:
+    case WM_POINTERUP:
+    case WM_POINTERENTER:
+    case WM_POINTERLEAVE:
+    case WM_POINTERCAPTURECHANGED:
+        // 触摸自行处理并消费，避免系统再合成为鼠标消息造成一次触摸响应两次
+        if (HandlePointerMessage(message, wParam)) {
             return 0;
         }
-        OnButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), false);
+        break;
+    case WM_LBUTTONDOWN:
+        DispatchPointerDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), false);
         return 0;
     case WM_MBUTTONDOWN:
-        if (settingsDialog_.isOpen()) {
-            return 0;
-        }
-        OnButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), true);
+        DispatchPointerDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam), true);
         return 0;
     case WM_LBUTTONUP:
-    case WM_MBUTTONUP: {
-        if (settingsDialog_.isOpen()) {
-            const POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
-            settingsDialog_.OnMouseUp(point);
-            if (!settingsDialog_.isOpen()) {
-                FinishSettingsDialog();
-            }
-            return 0;
-        }
-        OnButtonUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+    case WM_MBUTTONUP:
+        DispatchPointerUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
         return 0;
-    }
     case WM_MOUSEWHEEL: {
         POINT point = {GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam)};
         ::ScreenToClient(hwnd_, &point);
@@ -367,11 +383,22 @@ void MainWindow::OnTimer() {
         OnRender();
     }
 
+    // 后台保存完成后刷新相册：等队列排空再刷新，避免读到写了一半的照片
+    const unsigned long long completed = saveQueue_.completedCount();
+    if (completed != lastSaveCompleted_ && saveQueue_.pendingCount() == 0) {
+        lastSaveCompleted_ = completed;
+        RefreshAlbumPanelIfOpen();
+    }
+
     if (deps_.camera != nullptr && !deps_.camera->IsOpen() &&
         now - lastCameraMaintain_ >= kCameraMaintainIntervalMs) {
         lastCameraMaintain_ = now;
         if (deps_.onCameraMaintain) {
             deps_.onCameraMaintain();
+        }
+        // 摄像头热插拔重连后，按当前状态决定是否拉流（锁定/查看照片时不采集）
+        if (deps_.camera->IsOpen()) {
+            deps_.camera->SetActive(ShouldCapture());
         }
     }
 }
@@ -430,13 +457,21 @@ void MainWindow::OnRender() {
         }
     }
 
-    // 橡皮模式：跟随鼠标绘制圆形擦除范围
+    // 橡皮模式：绘制圆形擦除范围（触摸不移动系统鼠标指针，需用接触点位置）
     if (state_.tool == core::ToolMode::Erase && state_.pictureAnnotatable()) {
-        POINT cursor = {};
-        cursorInside_ = ::GetCursorPos(&cursor) != FALSE && ::ScreenToClient(hwnd_, &cursor) != FALSE;
-        if (cursorInside_) {
-            cursorPos_ = cursor;
-            cursorInside_ = cursor.x >= 0 && cursor.y >= 0 && cursor.x < width && cursor.y < height;
+        if (annotating_ && !touchContacts_.empty()) {
+            const POINT point = touchContacts_.front().pos;
+            cursorPos_ = point;
+            cursorInside_ = point.x >= 0 && point.y >= 0 && point.x < width && point.y < height;
+        } else {
+            POINT cursor = {};
+            cursorInside_ =
+                ::GetCursorPos(&cursor) != FALSE && ::ScreenToClient(hwnd_, &cursor) != FALSE;
+            if (cursorInside_) {
+                cursorPos_ = cursor;
+                cursorInside_ =
+                    cursor.x >= 0 && cursor.y >= 0 && cursor.x < width && cursor.y < height;
+            }
         }
         UpdateEraserCursor();
         if (EraserCursorVisible()) {
@@ -515,6 +550,10 @@ void MainWindow::UpdatePicture() {
         // 锁定状态：保持最后一帧，不再从摄像头取帧
         if (picturePixels_ == nullptr) {
             SetErrorPicture();
+        } else {
+            // 锁定期间画面归属也可能变化（如查看照片后返回相机），
+            // 需保证笔迹层属于当前画面，否则锁定状态下无法批注
+            EnsureAnnotationFor(CurrentAnnotationKey(), pictureWidth_, pictureHeight_);
         }
         return;
     }
@@ -989,8 +1028,7 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
             return;
         }
 
-        // 1. “更多”面板展开时优先处理其内容；面板外的画面区域仍可直接书写，
-        //    避免每次选完颜色/粗细后都要重新展开面板
+        // 1. “更多”面板展开时优先处理其内容
         if (morePanel_.isOpen()) {
             const MorePanelHit hit = morePanel_.HitTest(point);
             if (hit.kind != MorePanelHit::Kind::None) {
@@ -1025,20 +1063,27 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
             return;
         }
 
-        // 4. 相册面板展开时，点击面板与功能栏以外的空白区域收起面板；
+        // 4. 点击“更多”面板、其标签与功能栏以外的空白区域：收起“更多”面板
+        if (morePanel_.isOpen()) {
+            morePanel_.SetOpen(false);
+            morePanelDirty_ = true;
+            return;
+        }
+
+        // 5. 相册面板展开时，点击面板与功能栏以外的空白区域收起面板；
         //    仅收起面板，正在全屏查看的照片继续展示
         if (albumPanel_.isOpen()) {
             HideAlbumPanel();
             return;
         }
 
-        // 5. 预览框可见区域拖动（相册照片同样可拖动视野）
+        // 6. 预览框可见区域拖动（相册照片同样可拖动视野）
         if (state_.pictureZoomable() && preview_.HitTestViewport(point)) {
             draggingViewport_ = true;
             return;
         }
 
-        // 6. 批注/橡皮：在画面上书写或擦除
+        // 7. 批注/橡皮：在画面上书写或擦除
         if (state_.tool != core::ToolMode::Select) {
             if (state_.pictureAnnotatable() && annotation_.valid()) {
                 float imageX = 0.0f;
@@ -1130,17 +1175,246 @@ void MainWindow::OnMouseWheel(int delta, int x, int y) {
         ShowToast(L"无摄像头可用，无法缩放画面");
         return;
     }
-    const float factor = std::pow(1.1f, static_cast<float>(delta) / 120.0f);
-    const float oldZoom = state_.zoom;
-    state_.zoom = std::max(0.2f, std::min(10.0f, oldZoom * factor));
-    const float k = state_.zoom / oldZoom;
+    ApplyZoomAt(x, y, std::pow(1.1f, static_cast<float>(delta) / 120.0f));
+}
 
-    // 以鼠标位置为锚点缩放
+void MainWindow::ApplyZoomAt(int x, int y, float factor) {
+    if (factor <= 0.0f) {
+        return;
+    }
+    const float oldZoom = state_.zoom;
+    const float newZoom = std::max(0.2f, std::min(10.0f, oldZoom * factor));
+    if (newZoom == oldZoom) {
+        return;
+    }
+    state_.zoom = newZoom;
+    const float k = newZoom / oldZoom;
+
+    // 以锚点为不动点缩放（鼠标滚轮锚点为鼠标位置，双指捏合锚点为两指中心）
     const float relativeX = static_cast<float>(x) - clientWidth_ * 0.5f;
     const float relativeY = static_cast<float>(y) - clientHeight_ * 0.5f;
     state_.offsetX = relativeX - (relativeX - state_.offsetX) * k;
     state_.offsetY = relativeY - (relativeY - state_.offsetY) * k;
     ClampOffsets();
+}
+
+void MainWindow::DispatchPointerDown(int x, int y, bool middle) {
+    if (settingsDialog_.isOpen()) {
+        if (!middle) {
+            const POINT point = {x, y};
+            settingsDialog_.OnMouseDown(point);
+        }
+        return;
+    }
+    OnButtonDown(x, y, middle);
+}
+
+void MainWindow::DispatchPointerMove(int x, int y) {
+    if (settingsDialog_.isOpen()) {
+        const POINT point = {x, y};
+        settingsDialog_.OnMouseMove(point);
+        return;
+    }
+    OnMouseMove(x, y);
+}
+
+void MainWindow::DispatchPointerUp(int x, int y) {
+    if (settingsDialog_.isOpen()) {
+        const POINT point = {x, y};
+        settingsDialog_.OnMouseUp(point);
+        if (!settingsDialog_.isOpen()) {
+            FinishSettingsDialog();
+        }
+        return;
+    }
+    OnButtonUp(x, y);
+}
+
+bool MainWindow::HandlePointerMessage(UINT message, WPARAM wParam) {
+    const UINT32 pointerId = GET_POINTERID_WPARAM(wParam);
+    if (pointerId == 0) {
+        return false;
+    }
+    POINTER_INFO info = {};
+    if (!::GetPointerInfo(pointerId, &info)) {
+        return false;
+    }
+    if (info.pointerType != PT_TOUCH) {
+        // 笔/鼠标指针交默认处理（仍需系统合成为鼠标消息才能正常使用）
+        if (message == WM_POINTERDOWN) {
+            VB_INFO("非触摸指针被忽略: id=%u, type=%d", pointerId,
+                    static_cast<int>(info.pointerType));
+        }
+        return false;
+    }
+    POINT point = info.ptPixelLocation; // 屏幕物理像素
+    if (!::ScreenToClient(hwnd_, &point)) {
+        return false;
+    }
+
+    const bool removed = message == WM_POINTERUP || message == WM_POINTERLEAVE;
+    bool changed = false;
+    auto it = std::find_if(touchContacts_.begin(), touchContacts_.end(),
+                           [pointerId](const TouchContact& contact) {
+                               return contact.id == pointerId;
+                           });
+    if (removed) {
+        if (it != touchContacts_.end()) {
+            touchContacts_.erase(it);
+            changed = true;
+            VB_INFO("触摸抬起: id=%u, 剩余 %zu 指", pointerId, touchContacts_.size());
+        }
+    } else if (message == WM_POINTERDOWN || message == WM_POINTERUPDATE) {
+        if (it != touchContacts_.end()) {
+            if (it->pos.x != point.x || it->pos.y != point.y) {
+                it->pos = point;
+                changed = true;
+            }
+        } else {
+            TouchContact contact;
+            contact.id = pointerId;
+            contact.pos = point;
+            touchContacts_.push_back(contact);
+            changed = true;
+            VB_INFO("触摸按下: id=%u, 当前 %zu 指", pointerId, touchContacts_.size());
+        }
+    }
+    if (changed) {
+        UpdateTouchGesture();
+    }
+    // 触摸指针一律消费，确保系统不再合成触摸对应的鼠标消息
+    return true;
+}
+
+float MainWindow::TouchDistance() const {
+    if (touchContacts_.size() < 2) {
+        return 0.0f;
+    }
+    const float dx = static_cast<float>(touchContacts_[0].pos.x - touchContacts_[1].pos.x);
+    const float dy = static_cast<float>(touchContacts_[0].pos.y - touchContacts_[1].pos.y);
+    return std::sqrt(dx * dx + dy * dy);
+}
+
+POINT MainWindow::TouchCentroid() const {
+    POINT center = {0, 0};
+    if (touchContacts_.empty()) {
+        return center;
+    }
+    long long sumX = 0;
+    long long sumY = 0;
+    for (const TouchContact& contact : touchContacts_) {
+        sumX += contact.pos.x;
+        sumY += contact.pos.y;
+    }
+    const long long count = static_cast<long long>(touchContacts_.size());
+    center.x = static_cast<LONG>(sumX / count);
+    center.y = static_cast<LONG>(sumY / count);
+    return center;
+}
+
+void MainWindow::UpdateTouchGesture() {
+    const size_t count = touchContacts_.size();
+    if (count == 0) {
+        // 全部抬起：收尾单指动作或结束多指手势
+        if (touchMultiActive_) {
+            // 诊断：本次手势是否真的执行了平移
+            VB_INFO("触摸手势结束: 峰值 %d 指, 平移 %.0f,%.0f px（%d 次更新）",
+                    touchGestureMaxCount_, touchPanX_, touchPanY_, touchPanUpdates_);
+            touchMultiActive_ = false;
+        } else if (touchSingleActive_) {
+            touchSingleActive_ = false;
+            DispatchPointerUp(touchSinglePos_.x, touchSinglePos_.y);
+        }
+        touchModeCount_ = 0;
+        touchGestureMaxCount_ = 0;
+        touchLastDistance_ = 0.0f;
+        return;
+    }
+
+    if (count == 1) {
+        touchSinglePos_ = touchContacts_[0].pos;
+        if (touchMultiActive_) {
+            // 多指手势收尾阶段保留最后一指不派发，避免误触画面
+            return;
+        }
+        touchModeCount_ = 1;
+        if (touchSingleActive_) {
+            DispatchPointerMove(touchSinglePos_.x, touchSinglePos_.y);
+        } else {
+            // 单指等同鼠标左键：选择模式拖动、批注/橡皮书写、点击功能栏与面板
+            touchSingleActive_ = true;
+            DispatchPointerDown(touchSinglePos_.x, touchSinglePos_.y, false);
+        }
+        return;
+    }
+
+    // 两指及以上：进入手势（先结束正在进行中的单指动作）
+    if (!touchMultiActive_) {
+        if (touchSingleActive_) {
+            touchSingleActive_ = false;
+            DispatchPointerUp(touchSinglePos_.x, touchSinglePos_.y);
+        }
+        touchMultiActive_ = true;
+        touchModeCount_ = static_cast<int>(count);
+        touchGestureMaxCount_ = static_cast<int>(count);
+        touchPanUpdates_ = 0;
+        touchPanX_ = 0.0f;
+        touchPanY_ = 0.0f;
+        touchLastDistance_ = TouchDistance();
+        touchLastCentroid_ = TouchCentroid();
+        VB_INFO("触摸手势开始：%zu 指", count);
+        return;
+    }
+
+    if (static_cast<int>(count) != touchModeCount_) {
+        // 手指数变化（如抬起一指或接触抖动）：只重置基准，避免画面跳变
+        touchModeCount_ = static_cast<int>(count);
+        if (touchModeCount_ > touchGestureMaxCount_) {
+            touchGestureMaxCount_ = touchModeCount_;
+            if (touchGestureMaxCount_ >= 3) {
+                VB_INFO("触摸手势切换为多指拖动（%d 指）", touchGestureMaxCount_);
+            }
+        }
+        touchLastDistance_ = TouchDistance();
+        touchLastCentroid_ = TouchCentroid();
+        VB_INFO("触摸手指数变化: %zu 指（峰值 %d）", count, touchGestureMaxCount_);
+        return;
+    }
+
+    // 设置面板打开或画面不可缩放时不响应画面手势
+    if (settingsDialog_.isOpen() || !state_.pictureZoomable()) {
+        return;
+    }
+
+    if (touchGestureMaxCount_ >= 3) {
+        // 三指及以上：平移画面（本次手势已确认为拖动，抬起一指后仍继续平移）
+        const POINT centroid = TouchCentroid();
+        const int deltaX = centroid.x - touchLastCentroid_.x;
+        const int deltaY = centroid.y - touchLastCentroid_.y;
+        if (deltaX != 0 || deltaY != 0) {
+            state_.offsetX += static_cast<float>(deltaX);
+            state_.offsetY += static_cast<float>(deltaY);
+            ClampOffsets();
+            ++touchPanUpdates_;
+            touchPanX_ += static_cast<float>(deltaX);
+            touchPanY_ += static_cast<float>(deltaY);
+        }
+        touchLastCentroid_ = centroid;
+        touchLastDistance_ = TouchDistance();
+        return;
+    }
+
+    // 双指捏合：按两指距离变化比例缩放，锚点为两指中心
+    const float distance = TouchDistance();
+    if (touchLastDistance_ > 1.0f && distance > 1.0f) {
+        const float factor = distance / touchLastDistance_;
+        if (factor > 0.0f && factor < 100.0f) {
+            const POINT centroid = TouchCentroid();
+            ApplyZoomAt(centroid.x, centroid.y, factor);
+        }
+    }
+    touchLastDistance_ = distance;
+    touchLastCentroid_ = TouchCentroid();
 }
 
 void MainWindow::OnKeyDown(UINT key) {
@@ -1221,6 +1495,10 @@ void MainWindow::HandleToolButton(ToolButtonId id) {
         break;
     case ToolButtonId::Lock:
         state_.locked = !state_.locked;
+        // 锁定即停止拉流（保留设备句柄，解锁后迅速恢复）
+        if (deps_.camera != nullptr) {
+            deps_.camera->SetActive(!state_.locked);
+        }
         ShowToast(state_.locked ? L"画面已锁定" : L"已恢复实时画面");
         if (!state_.locked && deps_.camera != nullptr && !deps_.camera->IsOpen()) {
             state_.picture = core::PictureSource::None;
@@ -1324,9 +1602,14 @@ void MainWindow::FinishSettingsDialog() {
         VB_INFO("设置面板已取消");
     }
     if (deps_.camera != nullptr) {
-        // 正在查看照片时不恢复采集，避免无谓的后台解码
-        deps_.camera->SetActive(!AlbumPhotoShown());
+        // 正在查看照片或画面已锁定时不恢复采集，避免无谓的后台解码
+        deps_.camera->SetActive(ShouldCapture());
     }
+}
+
+bool MainWindow::ShouldCapture() const {
+    // 锁定画面或正在查看照片时停止拉流（保留设备句柄，恢复迅速）
+    return !state_.locked && !AlbumPhotoShown();
 }
 
 void MainWindow::ApplyConfigurationFromStore() {
@@ -1476,7 +1759,11 @@ void MainWindow::ShowAlbumPhoto(size_t index) {
     albumShownPath_ = path;
     albumShownName_ = photoLibrary_.at(index).name;
     albumShownIndex_ = static_cast<long long>(index);
-    currentFrame_.reset();
+    if (!state_.locked) {
+        // 非锁定状态：等新采集帧到达后自然替换照片画面
+        currentFrame_.reset();
+    }
+    // 锁定状态保留锁定帧，返回相机时可直接恢复（无需等待采集）
     picturePixels_ = albumImage_.pixels();
     pictureWidth_ = albumImage_.width();
     pictureHeight_ = albumImage_.height();
@@ -1511,9 +1798,10 @@ void MainWindow::HideAlbumPhoto() {
     // 照片的笔迹写回文件并释放；新的采集帧到达后恢复实时画面的笔迹
     ReleaseAnnotation();
     if (deps_.camera != nullptr) {
-        deps_.camera->SetActive(true); // 恢复采集
+        deps_.camera->SetActive(ShouldCapture()); // 恢复采集（画面被锁定时保持停止）
     }
-    // 画面像素保留上一张照片，等新的采集帧到达后自然替换（避免闪黑）。
+    RestorePictureFromPhoto();
+    // 非锁定状态画面像素保留上一张照片，等新的采集帧到达后自然替换（避免闪黑）；
     // albumImage_ 在 UpdatePicture 拿到新帧后再释放。
     state_.picture = core::PictureSource::Locked;
     state_.view = core::ViewMode::Live;
@@ -1521,6 +1809,20 @@ void MainWindow::HideAlbumPhoto() {
     albumPanelDirty_ = true;
     SyncToolbarState();
     VB_INFO("退出照片查看，恢复实时画面");
+}
+
+void MainWindow::RestorePictureFromPhoto() {
+    if (!state_.locked || !currentFrame_ || currentFrame_->pixels.empty()) {
+        return; // 非锁定状态：等待新的采集帧自然替换照片画面
+    }
+    // 锁定状态下不会再有新帧：直接回到锁定帧，并恢复实时画面的笔迹层
+    picturePixels_ = currentFrame_->pixels.data();
+    pictureWidth_ = currentFrame_->width;
+    pictureHeight_ = currentFrame_->height;
+    pictureStride_ = currentFrame_->stride;
+    pictureDirty_ = true;
+    albumImage_.Reset();
+    EnsureAnnotationFor(CurrentAnnotationKey(), pictureWidth_, pictureHeight_);
 }
 
 void MainWindow::HandleAlbumPanelHit(const AlbumPanelHit& hit) {
@@ -1718,15 +2020,20 @@ void MainWindow::DeleteAlbumPhoto(size_t index) {
         albumShownPath_.clear();
         albumShownIndex_ = -1;
         albumImage_.Reset();
-        picturePixels_ = nullptr;
-        pictureWidth_ = 0;
-        pictureHeight_ = 0;
-        pictureStride_ = 0;
-        pictureDirty_ = false;
-        state_.picture = core::PictureSource::None;
         state_.view = core::ViewMode::Live;
+        if (state_.locked && currentFrame_ && !currentFrame_->pixels.empty()) {
+            RestorePictureFromPhoto(); // 锁定状态回到锁定帧与实时笔迹层
+            state_.picture = core::PictureSource::Locked;
+        } else {
+            picturePixels_ = nullptr;
+            pictureWidth_ = 0;
+            pictureHeight_ = 0;
+            pictureStride_ = 0;
+            pictureDirty_ = false;
+            state_.picture = core::PictureSource::None;
+        }
         if (deps_.camera != nullptr) {
-            deps_.camera->SetActive(true);
+            deps_.camera->SetActive(ShouldCapture()); // 画面被锁定时保持停止采集
         }
         VB_INFO("正在查看的照片已删除，返回实时画面");
     }
@@ -1756,39 +2063,28 @@ void MainWindow::CapturePhoto() {
 
     SYSTEMTIME time = {};
     ::GetLocalTime(&time);
-    const std::wstring path = paths::JoinPath(photoDir, paths::PhotoFileName(time));
+    const std::wstring photoName = paths::PhotoFileName(time);
+    const std::wstring path = paths::JoinPath(photoDir, photoName);
 
-    // 拍照时把批注合成进 JPG
+    // 原画面（不含笔迹）交给后台保存线程编码，避免整帧 JPG 编码阻塞界面
+    const size_t size =
+        static_cast<size_t>(pictureStride_) * static_cast<size_t>(pictureHeight_);
+    std::vector<uint8_t> buffer(picturePixels_, picturePixels_ + size);
+    saveQueue_.Submit(path, std::move(buffer), pictureWidth_, pictureHeight_, pictureStride_,
+                      kPhotoJpegQuality);
+
+    // 笔迹与原画面分离：笔迹单独存为该照片的笔迹文件，
+    // 相册中查看时笔迹可继续擦除，导出时再按需合成
     const bool hasAnnotation = annotation_.valid() &&
                                annotation_.width() == pictureWidth_ &&
                                annotation_.height() == pictureHeight_ && !annotation_.empty();
     if (hasAnnotation) {
-        const size_t size =
-            static_cast<size_t>(pictureStride_) * static_cast<size_t>(pictureHeight_);
-        std::vector<uint8_t> composed(picturePixels_, picturePixels_ + size);
-        annotation_.Composite(composed.data(), pictureStride_);
-        if (img::SaveJpeg(path, composed.data(), pictureWidth_, pictureHeight_, pictureStride_,
-                          kPhotoJpegQuality)) {
-            VB_INFO("拍照已保存（含批注）: %ls (%dx%d)", path.c_str(), pictureWidth_,
-                    pictureHeight_);
-            ShowToast(L"照片已保存");
-            RefreshAlbumPanelIfOpen(); // 相册面板展开时立即出现新照片
-        } else {
-            VB_ERROR("拍照保存失败: %ls", path.c_str());
-            ShowToast(L"照片保存失败");
-        }
-        return;
+        annotation::SaveToFile(AnnotationPath(photoName), annotation_);
     }
-
-    if (img::SaveJpeg(path, picturePixels_, pictureWidth_, pictureHeight_, pictureStride_,
-                      kPhotoJpegQuality)) {
-        VB_INFO("拍照已保存: %ls (%dx%d)", path.c_str(), pictureWidth_, pictureHeight_);
-        ShowToast(L"照片已保存");
-        RefreshAlbumPanelIfOpen(); // 相册面板展开时立即出现新照片
-    } else {
-        VB_ERROR("拍照保存失败: %ls", path.c_str());
-        ShowToast(L"照片保存失败");
-    }
+    VB_INFO("拍照已提交保存%s: %ls (%dx%d)", hasAnnotation ? "（笔迹单独存放）" : "",
+            path.c_str(), pictureWidth_, pictureHeight_);
+    ShowToast(L"照片已保存");
+    // 相册面板展开时，保存线程完成后由 OnTimer 刷新，届时新照片才会落盘
 }
 
 void MainWindow::EnterMinimized() {
@@ -1809,9 +2105,9 @@ void MainWindow::LeaveMinimized() {
         return;
     }
     minimized_ = false;
-    // 正在查看相册照片时不恢复采集，避免无谓的后台解码
-    if (deps_.camera != nullptr && !AlbumPhotoShown()) {
-        deps_.camera->SetActive(true);
+    // 正在查看相册照片或画面锁定时不恢复采集，避免无谓的后台解码
+    if (deps_.camera != nullptr) {
+        deps_.camera->SetActive(ShouldCapture());
     }
     VB_INFO("展台已恢复，采集与渲染继续");
 }

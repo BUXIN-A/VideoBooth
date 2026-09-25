@@ -21,6 +21,7 @@
 #include "ui/Resources.h"
 #include "ui/SettingsDialog.h"
 #include "ui/Toolbar.h"
+#include "util/SaveQueue.h"
 
 namespace vb {
 namespace ui {
@@ -65,6 +66,17 @@ private:
     void OnButtonUp(int x, int y);
     void OnMouseWheel(int delta, int x, int y);
     void OnKeyDown(UINT key);
+    // 触摸（WM_POINTER）：单指按鼠标事件派发，双指捏合缩放，三指及以上平移
+    bool HandlePointerMessage(UINT message, WPARAM wParam);
+    void UpdateTouchGesture();
+    float TouchDistance() const;
+    POINT TouchCentroid() const;
+    // 指针（鼠标/触摸）统一派发：设置面板打开时转交设置面板处理
+    void DispatchPointerDown(int x, int y, bool middle);
+    void DispatchPointerMove(int x, int y);
+    void DispatchPointerUp(int x, int y);
+    // 以 (x,y) 为锚点缩放画面（鼠标滚轮与双指捏合共用）
+    void ApplyZoomAt(int x, int y, float factor);
 
     void Relayout();
     void SyncToolbarState();
@@ -98,6 +110,8 @@ private:
     void ClampOffsets();
     float ComputeScale() const;
     std::wstring PhotoDirectory() const;
+    // 当前是否应保持采集（锁定画面或正在查看照片时停止拉流）
+    bool ShouldCapture() const;
 
     // 相册
     bool AlbumPhotoShown() const { return !albumShownPath_.empty(); }
@@ -106,6 +120,8 @@ private:
     void BackToCamera();
     void ShowAlbumPhoto(size_t index);
     void HideAlbumPhoto();
+    // 退出照片画面：锁定状态恢复锁定帧与实时笔迹层；非锁定状态保留照片像素等待新帧
+    void RestorePictureFromPhoto();
     void RefreshShownIndex();
     void RefreshAlbumPanelIfOpen();
     void HandleAlbumPanelHit(const AlbumPanelHit& hit);
@@ -181,6 +197,27 @@ private:
     POINT cursorPos_ = {0, 0};       // 最近一次鼠标客户区位置
     bool cursorInside_ = false;      // 鼠标是否位于窗口客户区内
     int eraserCursorDiameter_ = 0;   // 已生成的圆环直径（屏幕像素）
+
+    // 触摸手势状态：触摸点集合 + 单指/多指派发与缩放基准
+    struct TouchContact {
+        UINT32 id = 0; // WM_POINTER 的 pointerId
+        POINT pos = {0, 0};
+    };
+    std::vector<TouchContact> touchContacts_;
+    bool touchSingleActive_ = false;   // 单指已按鼠标事件派发
+    bool touchMultiActive_ = false;    // 处于多指手势（锁存到全部抬起）
+    int touchModeCount_ = 0;           // 上一次手势使用的手指数
+    int touchGestureMaxCount_ = 0;     // 本次手势出现过的最大手指数（用于锁定缩放/平移模式）
+    float touchLastDistance_ = 0.0f;   // 双指距离基准
+    POINT touchLastCentroid_ = {0, 0}; // 手势中心基准
+    POINT touchSinglePos_ = {0, 0};
+    int touchPanUpdates_ = 0;   // 本次手势应用平移的次数（诊断）
+    float touchPanX_ = 0.0f;    // 本次手势累计平移量（诊断）
+    float touchPanY_ = 0.0f;
+
+    // 后台 JPG 保存线程（拍照等整帧编码不再阻塞界面）
+    img::JpegSaveQueue saveQueue_;
+    unsigned long long lastSaveCompleted_ = 0;
 
     bool toolbarDirty_ = true;
     bool morePanelDirty_ = true;
