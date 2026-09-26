@@ -58,19 +58,41 @@ void Toolbar::SetScale(float uiScale) {
 
 void Toolbar::Layout(int windowWidth, int windowHeight) {
     const float s = scale_;
-    const int buttonWidth = static_cast<int>(78.0f * s);
-    const int buttonHeight = static_cast<int>(84.0f * s);
-    const int gap = static_cast<int>(6.0f * s);
-    const int groupGap = static_cast<int>(18.0f * s);
-    const int padding = static_cast<int>(14.0f * s);
+    int buttonWidth = static_cast<int>(78.0f * s);
+    int buttonHeight = static_cast<int>(84.0f * s);
+    int gap = static_cast<int>(6.0f * s);
+    int groupGap = static_cast<int>(18.0f * s);
+    int padding = static_cast<int>(14.0f * s);
     const int margin = static_cast<int>(14.0f * s);
 
-    int totalLength = padding * 2;
-    for (int i = 0; i < kToolButtonCount; ++i) {
-        totalLength += (vertical_ ? buttonHeight : buttonWidth);
-        if (i + 1 < kToolButtonCount) {
-            totalLength += IsGroupBoundary(i) ? groupGap : gap;
+    // 按给定尺寸计算功能栏总长度
+    const auto measure = [this](int buttonW, int buttonH, int gapSize, int groupGapSize,
+                                int paddingSize) {
+        int total = paddingSize * 2;
+        for (int i = 0; i < kToolButtonCount; ++i) {
+            total += vertical_ ? buttonH : buttonW;
+            if (i + 1 < kToolButtonCount) {
+                total += IsGroupBoundary(i) ? groupGapSize : gapSize;
+            }
         }
+        return total;
+    };
+
+    // 总尺寸超出窗口可用长度时整体缩小，保证所有按钮始终可见
+    contentScale_ = 1.0f;
+    int totalLength = measure(buttonWidth, buttonHeight, gap, groupGap, padding);
+    const int available = (vertical_ ? windowHeight : windowWidth) - margin * 2;
+    if (available > 0 && totalLength > available) {
+        contentScale_ = static_cast<float>(available) / static_cast<float>(totalLength);
+        const auto shrink = [s, this](float logical) {
+            return std::max(1, static_cast<int>(logical * s * contentScale_ + 0.5f));
+        };
+        buttonWidth = shrink(78.0f);
+        buttonHeight = shrink(84.0f);
+        gap = shrink(6.0f);
+        groupGap = shrink(18.0f);
+        padding = shrink(14.0f);
+        totalLength = measure(buttonWidth, buttonHeight, gap, groupGap, padding);
     }
 
     if (vertical_) {
@@ -164,7 +186,8 @@ void Toolbar::Render(int hoverIndex, int pressedIndex) {
     }
     canvas_.Clear();
 
-    const float s = scale_;
+    // 内容尺寸随整体缩小比例一起缩放，保证与按钮矩形一致
+    const float s = scale_ * contentScale_;
     const int radius = static_cast<int>(16.0f * s);
     const RECT barRect = {0, 0, width, height};
     canvas_.FillRoundRect(barRect, radius, kBarColor, 236);

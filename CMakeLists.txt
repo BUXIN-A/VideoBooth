@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(VideoBooth VERSION 1.0.0 LANGUAGES CXX)
+project(VideoBooth VERSION 1.1.0 LANGUAGES CXX)
 
 if(NOT MSVC)
     message(FATAL_ERROR "VideoBooth 当前仅支持 MSVC 工具链构建")
@@ -67,6 +67,7 @@ target_link_libraries(VideoBooth PRIVATE
     user32
     gdi32
     advapi32
+    winhttp
     winmm)
 
 # 运行期资源：assets 与 exe 保持同级

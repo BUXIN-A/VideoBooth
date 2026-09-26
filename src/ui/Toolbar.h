@@ -57,6 +57,8 @@ private:
     Resources* resources_ = nullptr;
     bool vertical_ = false;
     float scale_ = 1.0f;
+    // 按钮总尺寸超出窗口时的整体缩小比例（1.0 表示按原尺寸绘制）
+    float contentScale_ = 1.0f;
     RECT bounds_ = {};
     std::vector<RECT> buttonRects_;
     std::vector<bool> active_;

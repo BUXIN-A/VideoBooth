@@ -2,10 +2,12 @@
 
 #include "core/Paths.h"
 #include "ui/FileDialog.h"
+#include "ui/TopmostScope.h"
 #include "util/Log.h"
 #include "util/Strings.h"
 
 #include <algorithm>
+#include <cmath>
 
 namespace vb {
 namespace ui {
@@ -14,15 +16,14 @@ namespace {
 // ---- 逻辑布局（按 UI 比例缩放） ----
 constexpr float kWindowWidth = 640.0f;
 constexpr float kTitleBarHeight = 56.0f;
+constexpr float kTabBarHeight = 46.0f;
+constexpr float kPageHeight = 250.0f;    // 选项卡内容高度（各页一致，避免切换时窗口跳动）
+constexpr float kPageTopPadding = 16.0f; // 页内容相对内容区顶部的留白
 constexpr float kFooterHeight = 76.0f;
 constexpr float kMargin = 22.0f;
 constexpr float kCardPaddingX = 18.0f;
-constexpr float kCardPaddingY = 18.0f;
-constexpr float kCardTitleHeight = 24.0f;
-constexpr float kCardTitleGap = 12.0f;
 constexpr float kRowHeight = 46.0f;
 constexpr float kRowPitch = 52.0f;
-constexpr float kFirstRowOffset = 54.0f; // 卡片内首行相对卡片顶
 constexpr float kLabelWidth = 116.0f;
 constexpr float kLabelControlGap = 12.0f;
 constexpr float kControlHeight = 38.0f;
@@ -38,21 +39,20 @@ constexpr float kWindowRadius = 18.0f;
 constexpr float kCardRadius = 14.0f;
 constexpr float kControlRadius = 9.0f;
 constexpr float kButtonRadius = 10.0f;
-
-// 卡片纵向布局（内容坐标）
-constexpr float kCard1Top = 0.0f;
-constexpr float kCard1Height = 222.0f;
-constexpr float kCard2Top = 236.0f; // 222 + 14
-constexpr float kCard2Height = 274.0f;
-constexpr float kCard3Top = 524.0f; // 236 + 274 + 14
-constexpr float kCard3Height = 222.0f;
-constexpr float kContentHeight = 746.0f;
+constexpr float kTabHeight = 34.0f;
+constexpr float kTabGap = 6.0f;
+constexpr float kTabPaddingX = 20.0f;
+constexpr float kAboutIconSize = 76.0f;
+constexpr float kAboutCheckWidth = 132.0f;
+constexpr float kDialogWidth = 360.0f;
+constexpr float kDialogHeight = 186.0f;
+constexpr float kDialogButtonWidth = 108.0f;
+constexpr float kDialogButtonHeight = 40.0f;
 
 // ---- 配色 ----
 constexpr COLORREF kWindowColor = RGB(255, 255, 255);
 constexpr COLORREF kWindowBorder = RGB(224, 227, 233);
 constexpr COLORREF kCardColor = RGB(246, 247, 249);
-constexpr COLORREF kCardTitleColor = RGB(132, 138, 148);
 constexpr COLORREF kLabelColor = RGB(74, 80, 90);
 constexpr COLORREF kValueColor = RGB(28, 32, 38);
 constexpr COLORREF kControlBack = RGB(255, 255, 255);
@@ -67,8 +67,15 @@ constexpr COLORREF kHintColor = RGB(152, 158, 168);
 constexpr COLORREF kCloseHover = RGB(238, 240, 244);
 constexpr COLORREF kScrollBar = RGB(206, 210, 216);
 constexpr COLORREF kListBorder = RGB(213, 218, 226);
+constexpr COLORREF kTabTextColor = RGB(96, 102, 112);
+constexpr COLORREF kSuccessColor = RGB(46, 152, 84);
+constexpr COLORREF kFailureColor = RGB(198, 74, 74);
+constexpr COLORREF kMaskColor = RGB(18, 21, 26);
 
 constexpr int kFpsPresets[] = {10, 15, 20, 24, 25, 30, 50, 60};
+
+// GUI 大小档位（倍率），另有「自适应窗口」一项
+constexpr double kGuiScalePresets[] = {0.8, 0.9, 1.0, 1.1, 1.25, 1.5};
 
 struct ResolutionPreset {
     int width;
@@ -79,6 +86,9 @@ constexpr ResolutionPreset kResolutionPresets[] = {
     {640, 480},   {800, 600},   {1024, 768},  {1280, 720},  {1600, 900},
     {1920, 1080}, {2560, 1440}, {3840, 2160},
 };
+
+const wchar_t* const kTabLabels[] = {L"基础", L"画面", L"渲染", L"关于"};
+constexpr int kTabCount = 4;
 
 bool InsideRect(int x, int y, const RECT& rect) {
     return x >= rect.left && x < rect.right && y >= rect.top && y < rect.bottom;
@@ -111,6 +121,10 @@ void FillTriangleDown(OverlayCanvas& canvas, int centerX, int top, int size, COL
     }
 }
 
+bool SameScale(double a, double b) {
+    return std::abs(a - b) < 0.001;
+}
+
 } // namespace
 
 int SettingsDialog::px(float logical) const {
@@ -137,17 +151,19 @@ SettingsDialog::Choice* SettingsDialog::FindChoice(Field field) {
 
 void SettingsDialog::Open(HWND owner, const core::AppConfig& config,
                           const std::vector<capture::CameraInfo>& cameras, float uiScale,
-                          int clientWidth, int clientHeight) {
+                          int clientWidth, int clientHeight, const img::Image* appIcon) {
     owner_ = owner;
     config_ = config;
     result_ = config;
     cameras_ = cameras;
+    appIcon_ = appIcon;
     uiScale_ = uiScale > 0.0f ? uiScale : 1.0f;
 
     accepted_ = false;
     open_ = true;
     dirty_ = true;
     openField_ = Field::None;
+    currentTab_ = Tab::Basic;
     scrollY_ = 0;
     hover_ = Hit();
     pressed_ = Hit();
@@ -161,6 +177,7 @@ void SettingsDialog::Close() {
     hover_ = Hit();
     pressed_ = Hit();
     openField_ = Field::None;
+    updateDialogOpen_ = false;
     canvas_.Release();
 }
 
@@ -169,12 +186,12 @@ void SettingsDialog::Relayout(int clientWidth, int clientHeight) {
         return;
     }
     const int margin = px(24.0f);
-    windowWidth_ = px(kWindowWidth);
-    // 依据客户区高度决定面板高度，内容超出时可滚动
-    const int desiredHeight = px(kTitleBarHeight + kContentHeight + kFooterHeight);
-    windowHeight_ = std::min(desiredHeight, std::max(px(400.0f), clientHeight - margin * 2));
-    originX_ = (clientWidth - windowWidth_) / 2;
-    originY_ = (clientHeight - windowHeight_) / 2;
+    // 窗口尺寸不足时同步收缩，避免面板超出客户区
+    windowWidth_ = std::min(px(kWindowWidth), std::max(px(300.0f), clientWidth - margin * 2));
+    const int desiredHeight = px(kTitleBarHeight + kTabBarHeight + kPageHeight + kFooterHeight);
+    windowHeight_ = std::min(desiredHeight, std::max(px(320.0f), clientHeight - margin * 2));
+    originX_ = std::max(0, (clientWidth - windowWidth_) / 2);
+    originY_ = std::max(0, (clientHeight - windowHeight_) / 2);
     UpdateLayout();
     dirty_ = true;
 }
@@ -240,6 +257,11 @@ bool SettingsDialog::OnKeyDown(UINT key) {
         return false;
     }
     if (key == VK_ESCAPE) {
+        if (updateDialogOpen_) {
+            updateDialogOpen_ = false;
+            dirty_ = true;
+            return true;
+        }
         accepted_ = false;
         Close();
         return true;
@@ -262,6 +284,41 @@ void SettingsDialog::BuildModel() {
     toolbar.items = {L"底部（横向）", L"两侧（纵向）"};
     toolbar.selected = config.IsToolbarVertical() ? 1 : 0;
     choices_.push_back(toolbar);
+
+    // GUI 大小：首项为自适应，其余为固定倍率
+    guiScaleValues_.clear();
+    guiScaleValues_.push_back(-1.0);
+    guiScaleValues_.insert(guiScaleValues_.end(), std::begin(kGuiScalePresets),
+                           std::end(kGuiScalePresets));
+    if (!config.guiScaleAuto) {
+        const auto match = std::find_if(guiScaleValues_.begin() + 1, guiScaleValues_.end(),
+                                        [&config](double value) {
+                                            return SameScale(value, config.guiScale);
+                                        });
+        if (match == guiScaleValues_.end()) {
+            // 配置中的自定义倍率不在档位内时补充一项，避免保存时被静默改动
+            const auto pos = std::lower_bound(guiScaleValues_.begin() + 1, guiScaleValues_.end(),
+                                              config.guiScale);
+            guiScaleValues_.insert(pos, config.guiScale);
+        }
+    }
+    Choice guiScale;
+    guiScale.field = Field::GuiScale;
+    for (size_t i = 0; i < guiScaleValues_.size(); ++i) {
+        if (i == 0) {
+            guiScale.items.emplace_back(L"自适应窗口");
+            if (config.guiScaleAuto) {
+                guiScale.selected = 0;
+            }
+            continue;
+        }
+        guiScale.items.push_back(
+            FormatW(L"%d%%", static_cast<int>(guiScaleValues_[i] * 100.0 + 0.5)));
+        if (!config.guiScaleAuto && SameScale(guiScaleValues_[i], config.guiScale)) {
+            guiScale.selected = static_cast<int>(i);
+        }
+    }
+    choices_.push_back(guiScale);
 
     Choice camera;
     camera.field = Field::Camera;
@@ -341,10 +398,24 @@ bool SettingsDialog::CollectValues() {
     const Choice* toolbar = FindChoice(Field::ToolbarPosition);
     config.toolbarPosition = (toolbar != nullptr && toolbar->selected == 1) ? "sides" : "bottom";
 
+    const Choice* guiScale = FindChoice(Field::GuiScale);
+    if (guiScale != nullptr && guiScale->selected >= 0 &&
+        static_cast<size_t>(guiScale->selected) < guiScaleValues_.size()) {
+        const double value = guiScaleValues_[static_cast<size_t>(guiScale->selected)];
+        if (value < 0.0) {
+            config.guiScaleAuto = true;
+        } else {
+            config.guiScaleAuto = false;
+            config.guiScale = value;
+        }
+    }
+
     // 临时文件夹：与默认目录一致时保持“自动”语义
     const std::wstring folder = Trim(folderPath_);
     if (!folder.empty() && !EqualsIgnoreCase(folder, paths::DefaultPhotoDir())) {
         if (!paths::EnsureDirectory(folder)) {
+            // 提示框需在主窗口置顶显示，否则会被全屏展台压在画面之下
+            TopmostScope topmost(owner_);
             ::MessageBoxW(owner_, L"所选临时文件夹不可用，请重新选择。", L"设置",
                           MB_ICONWARNING | MB_OK);
             return false;
@@ -388,10 +459,10 @@ bool SettingsDialog::CollectValues() {
 void SettingsDialog::UpdateLayout() {
     const auto P = [this](float value) { return px(value); };
 
-    bodyTop_ = P(kTitleBarHeight);
+    bodyTop_ = P(kTitleBarHeight + kTabBarHeight);
     bodyBottom_ = windowHeight_ - P(kFooterHeight);
-    const int contentHeight = P(kContentHeight);
-    maxScroll_ = std::max(0, contentHeight - (bodyBottom_ - bodyTop_));
+    const int pageHeight = P(kPageHeight);
+    maxScroll_ = std::max(0, pageHeight - (bodyBottom_ - bodyTop_));
     scrollY_ = std::max(0, std::min(scrollY_, maxScroll_));
 
     const int cardLeft = P(kMargin);
@@ -402,16 +473,21 @@ void SettingsDialog::UpdateLayout() {
     const int controlTopOffset = P((kRowHeight - kControlHeight) * 0.5f);
     const int switchOffset = P((kRowHeight - kSwitchHeight) * 0.5f);
 
-    // 内容坐标 → 窗口坐标
-    const auto rowTop = [&](float cardTop, int rowIndex) {
-        const int contentY = P(cardTop + kFirstRowOffset + rowIndex * kRowPitch);
-        return bodyTop_ - scrollY_ + contentY;
-    };
-    const auto fieldRect = [&](float cardTop, int rowIndex, int left, int top, int right,
-                               int bottom) {
-        const int baseY = rowTop(cardTop, rowIndex);
+    // 页内容坐标 → 窗口坐标（随滚动偏移）
+    const int pageTop = bodyTop_ - scrollY_ + P(kPageTopPadding);
+    const auto rowTop = [&](int rowIndex) { return pageTop + P(rowIndex * kRowPitch); };
+    const auto rowRect = [&](int rowIndex, int left, int top, int right, int bottom) {
+        const int baseY = rowTop(rowIndex);
         return RECT{left, baseY + top, right, baseY + bottom};
     };
+
+    // 先清空全部字段区域：未显示的选项卡字段因此不会参与命中
+    for (int i = 0; i < static_cast<int>(Field::Count); ++i) {
+        fieldRects_[i] = RECT{0, 0, 0, 0};
+        subRects_[i] = RECT{0, 0, 0, 0};
+    }
+    aboutIconRect_ = RECT{0, 0, 0, 0};
+    aboutCheckRect_ = RECT{0, 0, 0, 0};
 
     // 关闭按钮与底部按钮（不随内容滚动）
     closeRect_ = {windowWidth_ - P(kMargin) - P(kCloseSize), P((kTitleBarHeight - kCloseSize) * 0.5f),
@@ -422,47 +498,86 @@ void SettingsDialog::UpdateLayout() {
     cancelRect_ = {saveRect_.left - P(kButtonGap) - P(kButtonWidth), saveRect_.top,
                    saveRect_.left - P(kButtonGap), saveRect_.bottom};
 
-    // 基础
-    fieldRects_[static_cast<int>(Field::ToolbarPosition)] =
-        fieldRect(kCard1Top, 0, controlLeft, controlTopOffset, controlLeft + P(220.0f),
-                  controlTopOffset + P(kControlHeight));
+    // 选项卡标签（按文字宽度自适应，依次排列）
+    {
+        int left = cardLeft;
+        const int tabHeight = P(kTabHeight);
+        const int top = P(kTitleBarHeight) + (P(kTabBarHeight) - tabHeight) / 2;
+        for (int i = 0; i < kTabCount; ++i) {
+            const int textWidth = canvas_.MeasureText(kTabLabels[i], P(15.0f)).cx;
+            const int tabWidth = textWidth + P(kTabPaddingX) * 2;
+            tabRects_[i] = {left, top, left + tabWidth, top + tabHeight};
+            left += tabWidth + P(kTabGap);
+        }
+    }
 
-    const int browseWidth = P(kButtonWidth);
-    const int pathWidth = innerRight - controlLeft - browseWidth - P(10.0f);
-    fieldRects_[static_cast<int>(Field::FolderBrowse)] =
-        fieldRect(kCard1Top, 1, controlLeft, controlTopOffset, controlLeft + pathWidth,
-                  controlTopOffset + P(kControlHeight));
-    subRects_[static_cast<int>(Field::FolderBrowse)] =
-        fieldRect(kCard1Top, 1, controlLeft + pathWidth + P(10.0f), controlTopOffset, innerRight,
-                  controlTopOffset + P(kControlHeight));
-    fieldRects_[static_cast<int>(Field::SaveLog)] =
-        fieldRect(kCard1Top, 2, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
-                  switchOffset + P(kSwitchHeight));
+    switch (currentTab_) {
+    case Tab::Basic: {
+        fieldRects_[static_cast<int>(Field::ToolbarPosition)] =
+            rowRect(0, controlLeft, controlTopOffset, controlLeft + P(220.0f),
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::GuiScale)] =
+            rowRect(1, controlLeft, controlTopOffset, controlLeft + P(220.0f),
+                    controlTopOffset + P(kControlHeight));
+        const int browseWidth = P(kButtonWidth);
+        const int pathWidth = innerRight - controlLeft - browseWidth - P(10.0f);
+        fieldRects_[static_cast<int>(Field::FolderBrowse)] =
+            rowRect(2, controlLeft, controlTopOffset, controlLeft + pathWidth,
+                    controlTopOffset + P(kControlHeight));
+        subRects_[static_cast<int>(Field::FolderBrowse)] =
+            rowRect(2, controlLeft + pathWidth + P(10.0f), controlTopOffset, innerRight,
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::SaveLog)] =
+            rowRect(3, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
+                    switchOffset + P(kSwitchHeight));
+        break;
+    }
+    case Tab::Video: {
+        fieldRects_[static_cast<int>(Field::Camera)] =
+            rowRect(0, controlLeft, controlTopOffset, innerRight,
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::Fps)] =
+            rowRect(1, controlLeft, controlTopOffset, controlLeft + P(160.0f),
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::Resolution)] =
+            rowRect(2, controlLeft, controlTopOffset, controlLeft + P(220.0f),
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::AutoExposure)] =
+            rowRect(3, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
+                    switchOffset + P(kSwitchHeight));
+        break;
+    }
+    case Tab::Render: {
+        const Field fields[] = {Field::Vsync, Field::Antialias, Field::DoubleBuffer};
+        for (int i = 0; i < 3; ++i) {
+            fieldRects_[static_cast<int>(fields[i])] =
+                rowRect(i, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
+                        switchOffset + P(kSwitchHeight));
+        }
+        break;
+    }
+    case Tab::About: {
+        aboutIconRect_ = {innerLeft, pageTop + P(16.0f), innerLeft + P(kAboutIconSize),
+                          pageTop + P(16.0f + kAboutIconSize)};
+        aboutCheckRect_ = {innerLeft, pageTop + P(176.0f), innerLeft + P(kAboutCheckWidth),
+                           pageTop + P(176.0f + kButtonHeight)};
+        break;
+    }
+    }
 
-    // 画面
-    fieldRects_[static_cast<int>(Field::Camera)] =
-        fieldRect(kCard2Top, 0, controlLeft, controlTopOffset, innerRight,
-                  controlTopOffset + P(kControlHeight));
-    fieldRects_[static_cast<int>(Field::Fps)] =
-        fieldRect(kCard2Top, 1, controlLeft, controlTopOffset, controlLeft + P(160.0f),
-                  controlTopOffset + P(kControlHeight));
-    fieldRects_[static_cast<int>(Field::Resolution)] =
-        fieldRect(kCard2Top, 2, controlLeft, controlTopOffset, controlLeft + P(220.0f),
-                  controlTopOffset + P(kControlHeight));
-    fieldRects_[static_cast<int>(Field::AutoExposure)] =
-        fieldRect(kCard2Top, 3, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
-                  switchOffset + P(kSwitchHeight));
-
-    // 渲染
-    fieldRects_[static_cast<int>(Field::Vsync)] =
-        fieldRect(kCard3Top, 0, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
-                  switchOffset + P(kSwitchHeight));
-    fieldRects_[static_cast<int>(Field::Antialias)] =
-        fieldRect(kCard3Top, 1, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
-                  switchOffset + P(kSwitchHeight));
-    fieldRects_[static_cast<int>(Field::DoubleBuffer)] =
-        fieldRect(kCard3Top, 2, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
-                  switchOffset + P(kSwitchHeight));
+    // 更新提示浮层（居中，不随内容滚动）
+    const int dialogWidth = std::min(P(kDialogWidth), windowWidth_ - P(kMargin) * 2);
+    const int dialogHeight = P(kDialogHeight);
+    const int dialogLeft = (windowWidth_ - dialogWidth) / 2;
+    const int dialogTop = (windowHeight_ - dialogHeight) / 2;
+    updateDialogRect_ = {dialogLeft, dialogTop, dialogLeft + dialogWidth, dialogTop + dialogHeight};
+    const int dialogButtonWidth = P(kDialogButtonWidth);
+    const int dialogButtonHeight = P(kDialogButtonHeight);
+    const int buttonTop = updateDialogRect_.bottom - P(22.0f) - dialogButtonHeight;
+    updateDownloadRect_ = {updateDialogRect_.right - P(22.0f) - dialogButtonWidth, buttonTop,
+                           updateDialogRect_.right - P(22.0f), buttonTop + dialogButtonHeight};
+    updateLaterRect_ = {updateDownloadRect_.left - P(kButtonGap) - dialogButtonWidth, buttonTop,
+                        updateDownloadRect_.left - P(kButtonGap), buttonTop + dialogButtonHeight};
 
     // 展开的下拉列表
     listRect_ = {0, 0, 0, 0};
@@ -511,6 +626,15 @@ RECT SettingsDialog::FieldRect(Field field) const {
 
 SettingsDialog::Hit SettingsDialog::HitTest(int x, int y) const {
     Hit hit;
+    // 更新提示浮层为模态：只响应浮层内的按钮
+    if (updateDialogOpen_) {
+        if (InsideRect(x, y, updateDownloadRect_)) {
+            hit.field = Field::UpdateDownload;
+        } else if (InsideRect(x, y, updateLaterRect_)) {
+            hit.field = Field::UpdateLater;
+        }
+        return hit;
+    }
     // 展开的下拉列表优先响应
     if (openField_ != Field::None) {
         for (size_t i = 0; i < listItemRects_.size(); ++i) {
@@ -522,10 +646,24 @@ SettingsDialog::Hit SettingsDialog::HitTest(int x, int y) const {
             }
         }
     }
+    // 选项卡标签不随内容滚动
+    for (int i = 0; i < kTabCount; ++i) {
+        if (InsideRect(x, y, tabRects_[i])) {
+            hit.field = static_cast<Field>(static_cast<int>(Field::TabBasic) + i);
+            return hit;
+        }
+    }
+    // 当前选项卡内的字段
     for (int i = 1; i < static_cast<int>(Field::Count); ++i) {
         const Field field = static_cast<Field>(i);
         if (InsideRect(x, y, fieldRects_[i])) {
             hit.field = field;
+            return hit;
+        }
+    }
+    if (currentTab_ == Tab::About) {
+        if (InsideRect(x, y, aboutCheckRect_)) {
+            hit.field = Field::CheckUpdate;
             return hit;
         }
     }
@@ -562,7 +700,23 @@ void SettingsDialog::Activate(const Hit& hit) {
     }
 
     switch (hit.field) {
+    case Field::TabBasic:
+    case Field::TabVideo:
+    case Field::TabRender:
+    case Field::TabAbout: {
+        const Tab tab = static_cast<Tab>(static_cast<int>(hit.field) -
+                                        static_cast<int>(Field::TabBasic));
+        if (tab != currentTab_) {
+            currentTab_ = tab;
+            scrollY_ = 0;
+            openField_ = Field::None;
+            UpdateLayout();
+            dirty_ = true;
+        }
+        break;
+    }
     case Field::ToolbarPosition:
+    case Field::GuiScale:
     case Field::Camera:
     case Field::Fps:
     case Field::Resolution:
@@ -586,6 +740,23 @@ void SettingsDialog::Activate(const Hit& hit) {
     case Field::FolderBrowse:
         PickFolder();
         break;
+    case Field::CheckUpdate:
+        if (updateStatus_ != core::UpdateChecker::Status::Checking) {
+            // 请求由主窗口执行：面板只负责发起与展示状态
+            checkRequested_ = true;
+            updateStatus_ = core::UpdateChecker::Status::Checking;
+            dirty_ = true;
+        }
+        break;
+    case Field::UpdateDownload:
+        pendingOpenUrl_ = updateReleaseUrl_;
+        updateDialogOpen_ = false;
+        dirty_ = true;
+        break;
+    case Field::UpdateLater:
+        updateDialogOpen_ = false;
+        dirty_ = true;
+        break;
     case Field::Save:
         if (CollectValues()) {
             accepted_ = true;
@@ -602,13 +773,44 @@ void SettingsDialog::Activate(const Hit& hit) {
     }
 }
 
-void SettingsDialog::DrawCard(const RECT& rect, const std::wstring& title) {
+bool SettingsDialog::TakeCheckRequest() {
+    if (!checkRequested_) {
+        return false;
+    }
+    checkRequested_ = false;
+    return true;
+}
+
+bool SettingsDialog::SetUpdateState(core::UpdateChecker::Status status,
+                                    const std::wstring& latestVersion,
+                                    const std::wstring& releaseUrl) {
+    if (status == updateStatus_ && latestVersion == updateLatestVersion_ &&
+        releaseUrl == updateReleaseUrl_) {
+        return false;
+    }
+    const bool wasAvailable = updateStatus_ == core::UpdateChecker::Status::UpdateAvailable;
+    updateStatus_ = status;
+    updateLatestVersion_ = latestVersion;
+    updateReleaseUrl_ = releaseUrl;
+    if (status == core::UpdateChecker::Status::UpdateAvailable) {
+        if (!wasAvailable) {
+            updateDialogOpen_ = true; // 首次发现新版本时弹出提示
+        }
+    } else {
+        updateDialogOpen_ = false;
+    }
+    dirty_ = true;
+    return true;
+}
+
+std::wstring SettingsDialog::TakeOpenUrl() {
+    const std::wstring url = pendingOpenUrl_;
+    pendingOpenUrl_.clear();
+    return url;
+}
+
+void SettingsDialog::DrawPageCard(const RECT& rect) {
     canvas_.FillRoundRect(rect, px(kCardRadius), kCardColor, 255);
-    const RECT titleRect = {rect.left + px(kCardPaddingX), rect.top + px(kCardPaddingY),
-                            rect.right - px(kCardPaddingX),
-                            rect.top + px(kCardPaddingY + kCardTitleHeight)};
-    canvas_.DrawText(title, titleRect, px(13.0f), kCardTitleColor, 255,
-                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 void SettingsDialog::DrawLabel(const RECT& bounds, const std::wstring& text) {
@@ -691,6 +893,209 @@ void SettingsDialog::DrawDropdownList() {
     }
 }
 
+void SettingsDialog::DrawTabBar() {
+    const int lineY = bodyTop_ - 1;
+    canvas_.FillRect({0, lineY, windowWidth_, lineY + 1}, kWindowBorder, 255);
+    for (int i = 0; i < kTabCount; ++i) {
+        const Field field = static_cast<Field>(static_cast<int>(Field::TabBasic) + i);
+        const bool active = static_cast<int>(currentTab_) == i;
+        const bool hovered = hover_.field == field;
+        if (active) {
+            canvas_.FillRoundRect(tabRects_[i], px(kTabHeight) / 2, kAccentSoft, 255);
+        } else if (hovered) {
+            canvas_.FillRoundRect(tabRects_[i], px(kTabHeight) / 2, kButtonBack, 255);
+        }
+        canvas_.DrawText(kTabLabels[i], tabRects_[i], px(15.0f),
+                         active ? kAccent : kTabTextColor, 255);
+    }
+}
+
+void SettingsDialog::DrawBasicPage() {
+    const RECT card = {px(kMargin), bodyTop_ - scrollY_, windowWidth_ - px(kMargin),
+                       bodyTop_ - scrollY_ + px(kPageHeight)};
+    DrawPageCard(card);
+
+    const int innerLeft = px(kMargin) + px(kCardPaddingX);
+    const auto labelRect = [&](int rowIndex) {
+        const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + rowIndex * kRowPitch);
+        return RECT{innerLeft, baseY, innerLeft + px(kLabelWidth), baseY + px(kRowHeight)};
+    };
+    const auto drawDropdown = [&](Field field) {
+        const Choice* choice = FindChoice(field);
+        const std::wstring text =
+            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
+                ? choice->items[static_cast<size_t>(choice->selected)]
+                : std::wstring();
+        DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
+    };
+
+    DrawLabel(labelRect(0), L"功能栏位置");
+    drawDropdown(Field::ToolbarPosition);
+    DrawLabel(labelRect(1), L"GUI 大小");
+    drawDropdown(Field::GuiScale);
+    DrawLabel(labelRect(2), L"临时文件夹");
+    DrawPathField(FieldRect(Field::FolderBrowse), folderPath_,
+                  hover_.field == Field::FolderBrowse);
+    DrawButton(subRects_[static_cast<int>(Field::FolderBrowse)], L"选择文件夹", false,
+               hover_.field == Field::FolderBrowse);
+    DrawLabel(labelRect(3), L"保存运行日志");
+    DrawSwitch(FieldRect(Field::SaveLog), saveLog_, hover_.field == Field::SaveLog);
+    const RECT saveLogRect = FieldRect(Field::SaveLog);
+    const RECT saveLogHint = {saveLogRect.right + px(14.0f), labelRect(3).top,
+                              windowWidth_ - px(kMargin) - px(kCardPaddingX), labelRect(3).bottom};
+    canvas_.DrawText(L"关闭后不再写入日志文件", saveLogHint, px(13.0f), kHintColor, 255,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+}
+
+void SettingsDialog::DrawVideoPage() {
+    const RECT card = {px(kMargin), bodyTop_ - scrollY_, windowWidth_ - px(kMargin),
+                       bodyTop_ - scrollY_ + px(kPageHeight)};
+    DrawPageCard(card);
+
+    const int innerLeft = px(kMargin) + px(kCardPaddingX);
+    const auto labelRect = [&](int rowIndex) {
+        const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + rowIndex * kRowPitch);
+        return RECT{innerLeft, baseY, innerLeft + px(kLabelWidth), baseY + px(kRowHeight)};
+    };
+    const auto drawDropdown = [&](Field field) {
+        const Choice* choice = FindChoice(field);
+        const std::wstring text =
+            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
+                ? choice->items[static_cast<size_t>(choice->selected)]
+                : std::wstring();
+        DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
+    };
+
+    DrawLabel(labelRect(0), L"默认摄像头");
+    drawDropdown(Field::Camera);
+    DrawLabel(labelRect(1), L"摄像头刷新率");
+    drawDropdown(Field::Fps);
+    DrawLabel(labelRect(2), L"摄像头分辨率");
+    drawDropdown(Field::Resolution);
+    DrawLabel(labelRect(3), L"自动曝光");
+    DrawSwitch(FieldRect(Field::AutoExposure), autoExposure_,
+               hover_.field == Field::AutoExposure);
+}
+
+void SettingsDialog::DrawRenderPage() {
+    const RECT card = {px(kMargin), bodyTop_ - scrollY_, windowWidth_ - px(kMargin),
+                       bodyTop_ - scrollY_ + px(kPageHeight)};
+    DrawPageCard(card);
+
+    const int innerLeft = px(kMargin) + px(kCardPaddingX);
+    const int innerRight = windowWidth_ - px(kMargin) - px(kCardPaddingX);
+    const wchar_t* labels[] = {L"垂直同步", L"抗锯齿（多重采样）", L"双缓冲"};
+    const Field fields[] = {Field::Vsync, Field::Antialias, Field::DoubleBuffer};
+    const bool values[] = {vsync_, antialias_, doubleBuffer_};
+    for (int i = 0; i < 3; ++i) {
+        const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + i * kRowPitch);
+        const RECT labelRect = {innerLeft, baseY, innerLeft + px(kLabelWidth),
+                                baseY + px(kRowHeight)};
+        DrawLabel(labelRect, labels[i]);
+        const RECT rect = FieldRect(fields[i]);
+        DrawSwitch(rect, values[i], hover_.field == fields[i]);
+        if (i > 0) {
+            const RECT hint = {rect.right + px(14.0f), baseY, innerRight, baseY + px(kRowHeight)};
+            canvas_.DrawText(L"（需重启程序生效）", hint, px(13.0f), kHintColor, 255,
+                             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+}
+
+void SettingsDialog::DrawAboutPage() {
+    const RECT card = {px(kMargin), bodyTop_ - scrollY_, windowWidth_ - px(kMargin),
+                       bodyTop_ - scrollY_ + px(kPageHeight)};
+    DrawPageCard(card);
+
+    // 程序图标（等比适配到方形区域内）
+    if (appIcon_ != nullptr && appIcon_->Valid()) {
+        const int boxSize = aboutIconRect_.right - aboutIconRect_.left;
+        const float fit = std::min(static_cast<float>(boxSize) / appIcon_->width(),
+                                   static_cast<float>(boxSize) / appIcon_->height());
+        const int drawWidth = std::max(1, static_cast<int>(appIcon_->width() * fit));
+        const int drawHeight = std::max(1, static_cast<int>(appIcon_->height() * fit));
+        const int left = aboutIconRect_.left + (boxSize - drawWidth) / 2;
+        const int top = aboutIconRect_.top + (boxSize - drawHeight) / 2;
+        const RECT dest = {left, top, left + drawWidth, top + drawHeight};
+        canvas_.DrawPixels(appIcon_->pixels(), appIcon_->width(), appIcon_->height(),
+                           appIcon_->stride(), dest);
+    } else {
+        canvas_.FillRoundRect(aboutIconRect_, px(kCardRadius), kAccentSoft, 255);
+        canvas_.DrawText(L"VB", aboutIconRect_, px(24.0f), kAccent, 255);
+    }
+
+    const int textLeft = aboutIconRect_.right + px(18.0f);
+    const int textRight = windowWidth_ - px(kMargin) - px(kCardPaddingX);
+    const int nameTop = aboutIconRect_.top + px(6.0f);
+    canvas_.DrawText(L"VideoBooth 视频展台",
+                     {textLeft, nameTop, textRight, nameTop + px(28.0f)}, px(18.0f),
+                     kValueColor, 255, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    canvas_.DrawText(FormatW(L"版本 %s", Utf8ToWide(core::kAppVersion).c_str()),
+                     {textLeft, nameTop + px(30.0f), textRight, nameTop + px(52.0f)}, px(13.0f),
+                     kHintColor, 255, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    canvas_.DrawText(L"面向学校低配教学一体机的高性能视频展台，零第三方依赖。",
+                     {textLeft, nameTop + px(58.0f), textRight, nameTop + px(80.0f)}, px(13.0f),
+                     kHintColor, 255, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DrawButton(aboutCheckRect_, L"检查更新", false, hover_.field == Field::CheckUpdate);
+
+    // 检查状态提示（按钮右侧）
+    std::wstring status;
+    COLORREF color = kHintColor;
+    switch (updateStatus_) {
+    case core::UpdateChecker::Status::Checking:
+        status = L"正在检查…";
+        break;
+    case core::UpdateChecker::Status::UpToDate:
+        status = L"已是最新版本";
+        color = kSuccessColor;
+        break;
+    case core::UpdateChecker::Status::UpdateAvailable:
+        status = FormatW(L"发现新版本 %ls", updateLatestVersion_.c_str());
+        color = kAccent;
+        break;
+    case core::UpdateChecker::Status::Failed:
+        status = L"检查更新失败，请检查网络";
+        color = kFailureColor;
+        break;
+    default:
+        status = L"从 GitHub 获取最新版本信息";
+        break;
+    }
+    const RECT statusRect = {aboutCheckRect_.right + px(14.0f), aboutCheckRect_.top,
+                             windowWidth_ - px(kMargin) - px(kCardPaddingX),
+                             aboutCheckRect_.bottom};
+    canvas_.DrawText(status, statusRect, px(13.0f), color, 255,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+}
+
+void SettingsDialog::DrawUpdateDialog() {
+    if (!updateDialogOpen_) {
+        return;
+    }
+    // 遮罩：突出提示浮层
+    canvas_.FillRect({0, 0, windowWidth_, windowHeight_}, kMaskColor, 120);
+    canvas_.FillRoundRect(updateDialogRect_, px(kCardRadius), kWindowBorder, 255);
+    RECT inner = {updateDialogRect_.left + 1, updateDialogRect_.top + 1,
+                  updateDialogRect_.right - 1, updateDialogRect_.bottom - 1};
+    canvas_.FillRoundRect(inner, px(kCardRadius) - 1, kWindowColor, 255);
+
+    const int left = updateDialogRect_.left + px(22.0f);
+    const int right = updateDialogRect_.right - px(22.0f);
+    const int titleTop = updateDialogRect_.top + px(22.0f);
+    canvas_.DrawText(L"发现新版本", {left, titleTop, right, titleTop + px(30.0f)}, px(18.0f),
+                     kValueColor, 255, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    const std::wstring body =
+        FormatW(L"当前版本 %s，最新版本 %s。\n是否前往 GitHub 下载更新？",
+                Utf8ToWide(core::kAppVersion).c_str(), updateLatestVersion_.c_str());
+    canvas_.DrawText(body, {left, titleTop + px(38.0f), right, titleTop + px(96.0f)}, px(14.0f),
+                     kLabelColor, 255, DT_LEFT | DT_TOP | DT_WORDBREAK);
+
+    DrawButton(updateLaterRect_, L"以后再说", false, hover_.field == Field::UpdateLater);
+    DrawButton(updateDownloadRect_, L"前往下载", true, hover_.field == Field::UpdateDownload);
+}
+
 void SettingsDialog::Render() {
     if (windowWidth_ <= 0 || windowHeight_ <= 0) {
         return;
@@ -706,100 +1111,31 @@ void SettingsDialog::Render() {
     canvas_.FillRoundRect(inner, px(kWindowRadius) - 1, kWindowColor, 255);
 
     // 标题栏
-    canvas_.FillRect({0, bodyTop_ - 1, windowWidth_, bodyTop_}, kWindowBorder, 255);
     const RECT titleRect = {px(kMargin), 0, windowWidth_ - px(kMargin) - px(kCloseSize + 8.0f),
-                            bodyTop_};
+                            px(kTitleBarHeight)};
     canvas_.DrawText(L"设置", titleRect, px(19.0f), RGB(26, 30, 36), 255,
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-
     if (hover_.field == Field::Close) {
         canvas_.FillRoundRect(closeRect_, px(8.0f), kCloseHover, 255);
     }
     canvas_.DrawText(L"×", closeRect_, px(19.0f), RGB(110, 116, 126), 255);
 
-    // 内容区（滚动裁剪）
+    // 选项卡栏与内容区（内容超出时裁剪滚动）
+    DrawTabBar();
     canvas_.SetClipRect({0, bodyTop_, windowWidth_, bodyBottom_});
-
-    const int cardLeft = px(kMargin);
-    const int cardRight = windowWidth_ - px(kMargin);
-    const int innerLeft = cardLeft + px(kCardPaddingX);
-    const int innerRight = cardRight - px(kCardPaddingX);
-    const auto rowTop = [&](float cardTop, int rowIndex) {
-        return bodyTop_ - scrollY_ + px(cardTop + kFirstRowOffset + rowIndex * kRowPitch);
-    };
-    // 下拉框：显示当前选中项，展开时高亮
-    const auto drawDropdown = [&](Field field) {
-        const Choice* choice = FindChoice(field);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
-    };
-
-    // 基础
-    const int card1Top = bodyTop_ - scrollY_ + px(kCard1Top);
-    DrawCard({cardLeft, card1Top, cardRight, card1Top + px(kCard1Height)}, L"基础");
-    DrawLabel({innerLeft, rowTop(kCard1Top, 0), innerLeft + px(kLabelWidth),
-               rowTop(kCard1Top, 0) + px(kRowHeight)},
-              L"功能栏位置");
-    drawDropdown(Field::ToolbarPosition);
-    DrawLabel({innerLeft, rowTop(kCard1Top, 1), innerLeft + px(kLabelWidth),
-               rowTop(kCard1Top, 1) + px(kRowHeight)},
-              L"临时文件夹");
-    DrawPathField(FieldRect(Field::FolderBrowse), folderPath_,
-                  hover_.field == Field::FolderBrowse);
-    DrawButton(subRects_[static_cast<int>(Field::FolderBrowse)], L"选择文件夹", false,
-               hover_.field == Field::FolderBrowse);
-    DrawLabel({innerLeft, rowTop(kCard1Top, 2), innerLeft + px(kLabelWidth),
-               rowTop(kCard1Top, 2) + px(kRowHeight)},
-              L"保存运行日志");
-    DrawSwitch(FieldRect(Field::SaveLog), saveLog_, hover_.field == Field::SaveLog);
-    {
-        const RECT hint = {FieldRect(Field::SaveLog).right + px(14.0f), rowTop(kCard1Top, 2),
-                           innerRight, rowTop(kCard1Top, 2) + px(kRowHeight)};
-        canvas_.DrawText(L"关闭后不再写入日志文件", hint, px(13.0f), kHintColor, 255,
-                         DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-    }
-
-    // 画面
-    const int card2Top = bodyTop_ - scrollY_ + px(kCard2Top);
-    DrawCard({cardLeft, card2Top, cardRight, card2Top + px(kCard2Height)}, L"画面");
-    DrawLabel({innerLeft, rowTop(kCard2Top, 0), innerLeft + px(kLabelWidth),
-               rowTop(kCard2Top, 0) + px(kRowHeight)},
-              L"默认摄像头");
-    drawDropdown(Field::Camera);
-    DrawLabel({innerLeft, rowTop(kCard2Top, 1), innerLeft + px(kLabelWidth),
-               rowTop(kCard2Top, 1) + px(kRowHeight)},
-              L"摄像头刷新率");
-    drawDropdown(Field::Fps);
-    DrawLabel({innerLeft, rowTop(kCard2Top, 2), innerLeft + px(kLabelWidth),
-               rowTop(kCard2Top, 2) + px(kRowHeight)},
-              L"摄像头分辨率");
-    drawDropdown(Field::Resolution);
-    DrawLabel({innerLeft, rowTop(kCard2Top, 3), innerLeft + px(kLabelWidth),
-               rowTop(kCard2Top, 3) + px(kRowHeight)},
-              L"自动曝光");
-    DrawSwitch(FieldRect(Field::AutoExposure), autoExposure_,
-               hover_.field == Field::AutoExposure);
-
-    // 渲染
-    const int card3Top = bodyTop_ - scrollY_ + px(kCard3Top);
-    DrawCard({cardLeft, card3Top, cardRight, card3Top + px(kCard3Height)}, L"渲染");
-    const wchar_t* renderLabels[] = {L"垂直同步", L"抗锯齿（多重采样）", L"双缓冲"};
-    const Field renderFields[] = {Field::Vsync, Field::Antialias, Field::DoubleBuffer};
-    const bool renderValues[] = {vsync_, antialias_, doubleBuffer_};
-    for (int i = 0; i < 3; ++i) {
-        const int top = rowTop(kCard3Top, i);
-        DrawLabel({innerLeft, top, innerLeft + px(kLabelWidth), top + px(kRowHeight)},
-                  renderLabels[i]);
-        const RECT rect = FieldRect(renderFields[i]);
-        DrawSwitch(rect, renderValues[i], hover_.field == renderFields[i]);
-        if (i > 0) {
-            const RECT hint = {rect.right + px(14.0f), top, innerRight, top + px(kRowHeight)};
-            canvas_.DrawText(L"（需重启程序生效）", hint, px(13.0f), kHintColor, 255,
-                             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        }
+    switch (currentTab_) {
+    case Tab::Basic:
+        DrawBasicPage();
+        break;
+    case Tab::Video:
+        DrawVideoPage();
+        break;
+    case Tab::Render:
+        DrawRenderPage();
+        break;
+    case Tab::About:
+        DrawAboutPage();
+        break;
     }
     canvas_.ResetClip();
 
@@ -809,13 +1145,13 @@ void SettingsDialog::Render() {
         const int trackBottom = bodyBottom_ - px(6.0f);
         const int trackHeight = trackBottom - trackTop;
         const int thumbHeight =
-            std::max(px(40.0f), trackHeight * (trackBottom - trackTop) /
-                                    std::max(1, trackBottom - trackTop + maxScroll_));
+            std::max(px(40.0f),
+                     trackHeight * trackHeight / std::max(1, trackHeight + maxScroll_));
         const int thumbTop =
             trackTop + (trackHeight - thumbHeight) * scrollY_ / std::max(1, maxScroll_);
         const int barLeft = windowWidth_ - px(10.0f);
-        canvas_.FillRoundRect({barLeft, trackTop, barLeft + px(4.0f), trackBottom},
-                              px(2.0f), kScrollBar, 180);
+        canvas_.FillRoundRect({barLeft, trackTop, barLeft + px(4.0f), trackBottom}, px(2.0f),
+                              kScrollBar, 180);
         canvas_.FillRoundRect({barLeft, thumbTop, barLeft + px(4.0f), thumbTop + thumbHeight},
                               px(2.0f), RGB(150, 156, 166), 255);
     }
@@ -824,10 +1160,13 @@ void SettingsDialog::Render() {
     DrawButton(cancelRect_, L"取消", false, hover_.field == Field::Cancel);
     DrawButton(saveRect_, L"保存", true, hover_.field == Field::Save);
 
-    // 展开的下拉列表绘制在最上层
+    // 展开的下拉列表绘制在内容之上
     if (openField_ != Field::None) {
         DrawDropdownList();
     }
+
+    // 更新提示浮层位于最上层
+    DrawUpdateDialog();
 }
 
 } // namespace ui

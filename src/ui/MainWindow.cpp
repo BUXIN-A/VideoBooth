@@ -11,6 +11,7 @@
 #include <windows.h>
 #include <windowsx.h>
 
+#include <shellapi.h>
 #include <shobjidl.h>
 #include <wrl/client.h>
 
@@ -34,6 +35,9 @@ constexpr ULONGLONG kToastDurationMs = 2000;
 constexpr int kPhotoJpegQuality = 85;
 // 拍照反馈：全屏白闪时长（渐隐）
 constexpr ULONGLONG kFlashDurationMs = 150;
+// 自适应 GUI 缩放时“窗口高度 / 1080”的比例上下限，避免极端分辨率下界面过大或过小
+constexpr float kMinAutoScaleRatio = 0.8f;
+constexpr float kMaxAutoScaleRatio = 1.4f;
 
 const gfx::Color kBackdrop(0.07f, 0.07f, 0.07f, 1.0f);
 
@@ -184,8 +188,17 @@ bool MainWindow::Create(HINSTANCE instance, const MainWindowDeps& deps) {
     VB_INFO("主窗口已创建（全屏）: %dx%d", areaWidth, areaHeight);
 
     const UINT dpi = ::GetDpiForWindow(hwnd_);
-    uiScale_ = dpi > 0 ? static_cast<float>(dpi) / 96.0f : 1.0f;
-    VB_INFO("主窗口 UI 缩放比例: %.2f (DPI %u)", uiScale_, dpi);
+    dpiScale_ = dpi > 0 ? static_cast<float>(dpi) / 96.0f : 1.0f;
+    {
+        // 自适应 GUI 缩放依赖客户区尺寸，创建后先行取值
+        RECT client = {};
+        ::GetClientRect(hwnd_, &client);
+        clientWidth_ = client.right - client.left;
+        clientHeight_ = client.bottom - client.top;
+    }
+    uiScale_ = ComputeUiScale();
+    VB_INFO("主窗口 UI 缩放比例: %.2f (DPI %u, GUI 大小=%s)", uiScale_, dpi,
+            deps_.configStore->Get().guiScaleAuto ? "自适应" : "固定倍率");
 
     toolbar_.Init(deps_.resources, deps_.configStore->Get().IsToolbarVertical());
     toolbar_.SetScale(uiScale_);
@@ -301,6 +314,8 @@ LRESULT MainWindow::OnMessage(UINT message, WPARAM wParam, LPARAM lParam) {
             }
             clientWidth_ = LOWORD(lParam);
             clientHeight_ = HIWORD(lParam);
+            // 自适应模式下 GUI 缩放随窗口尺寸变化
+            ApplyUiScale();
             Relayout();
         }
         return 0;
@@ -398,6 +413,20 @@ void MainWindow::OnTimer() {
     if (completed != lastSaveCompleted_ && saveQueue_.pendingCount() == 0) {
         lastSaveCompleted_ = completed;
         RefreshAlbumPanelIfOpen();
+    }
+
+    // 设置面板打开期间驱动更新检查：发起请求、同步状态、打开下载页
+    if (settingsOpen_) {
+        if (settingsDialog_.TakeCheckRequest()) {
+            updateChecker_.Start(Utf8ToWide(core::kAppVersion));
+        }
+        settingsDialog_.SetUpdateState(updateChecker_.status(), updateChecker_.latestVersion(),
+                                       updateChecker_.releaseUrl());
+        const std::wstring url = settingsDialog_.TakeOpenUrl();
+        if (!url.empty()) {
+            ::ShellExecuteW(hwnd_, L"open", url.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+            VB_INFO("已打开更新下载页: %ls", url.c_str());
+        }
     }
 
     if (deps_.camera != nullptr && !deps_.camera->IsOpen() &&
@@ -909,7 +938,7 @@ void MainWindow::Relayout() {
         clientHeight_ = client.bottom;
     }
     toolbar_.Layout(clientWidth_, clientHeight_);
-    preview_.Layout(clientHeight_);
+    preview_.Layout(clientWidth_, clientHeight_, toolbar_.bounds());
     // “更多”标签贴在所选模式按钮外侧（底部功能栏为正上方，两侧功能栏为左侧）
     const int anchorIndex = state_.tool == core::ToolMode::Erase
                                 ? static_cast<int>(ToolButtonId::Erase)
@@ -953,6 +982,12 @@ void MainWindow::SyncToolbarState() {
 
 void MainWindow::OnMouseMove(int x, int y) {
     POINT point = {x, y};
+
+    // 预览框位置拖动：按住预览框空白区域移动预览框
+    if (preview_.IsPositionDragging()) {
+        preview_.DragPosition(x, y);
+        return;
+    }
 
     // 相册面板：拖动滚动与按钮悬停优先
     if (albumPanel_.IsDragging()) {
@@ -1100,9 +1135,13 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
             return;
         }
 
-        // 6. 预览框可见区域拖动（相册照片同样可拖动视野）
-        if (state_.pictureZoomable() && preview_.HitTestViewport(point)) {
-            draggingViewport_ = true;
+        // 6. 预览框：虚线框内按住可平移画面（相册照片同样适用），其余区域按住可移动预览框本身
+        if (preview_.ContainsPoint(point)) {
+            if (state_.pictureZoomable() && preview_.HitTestViewport(point)) {
+                draggingViewport_ = true;
+            } else {
+                preview_.BeginPositionDrag(x, y);
+            }
             return;
         }
 
@@ -1129,6 +1168,11 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
 void MainWindow::OnButtonUp(int x, int y) {
     if (::GetCapture() == hwnd_) {
         ::ReleaseCapture();
+    }
+
+    if (preview_.IsPositionDragging()) {
+        preview_.EndPositionDrag();
+        return;
     }
 
     if (moreSliderDrag_) {
@@ -1563,8 +1607,11 @@ void MainWindow::OpenSettingsDialog() {
     // 全屏主窗口会被系统按“全屏优化”直接扫描输出，独立设置窗口会被压在画面之下。
     // 因此设置界面不再创建窗口，而是作为一层浮层随展台画面一起绘制、由主窗口转发输入。
     const std::vector<capture::CameraInfo> devices = capture::EnumerateCameras();
+    // 「关于」页显示程序图标（assets/icon.png）
+    const img::Image* appIcon =
+        deps_.resources != nullptr ? deps_.resources->Get(L"icon.png") : nullptr;
     settingsDialog_.Open(hwnd_, deps_.configStore->Get(), devices, uiScale_, clientWidth_,
-                         clientHeight_);
+                         clientHeight_, appIcon);
     VB_INFO("设置面板已展开，采集已暂停");
 }
 
@@ -1601,6 +1648,33 @@ bool MainWindow::ShouldCapture() const {
     return !state_.locked && !AlbumPhotoShown();
 }
 
+float MainWindow::ComputeUiScale() const {
+    if (deps_.configStore == nullptr) {
+        return dpiScale_;
+    }
+    const core::AppConfig& config = deps_.configStore->Get();
+    if (config.guiScaleAuto) {
+        // 自适应：以窗口高度相对 1080p 的比例为基准并限制范围；4K 等大屏由 DPI 缩放补充
+        const float ratio =
+            clientHeight_ > 0 ? static_cast<float>(clientHeight_) / 1080.0f : 1.0f;
+        return dpiScale_ * std::max(kMinAutoScaleRatio, std::min(kMaxAutoScaleRatio, ratio));
+    }
+    return dpiScale_ * static_cast<float>(config.guiScale);
+}
+
+void MainWindow::ApplyUiScale() {
+    const float previous = uiScale_;
+    uiScale_ = ComputeUiScale();
+    if (uiScale_ == previous) {
+        return;
+    }
+    toolbar_.SetScale(uiScale_);
+    preview_.SetScale(uiScale_);
+    morePanel_.SetScale(uiScale_);
+    albumPanel_.SetScale(uiScale_);
+    VB_INFO("界面缩放已更新: %.2f", uiScale_);
+}
+
 void MainWindow::ApplyConfigurationFromStore() {
     if (deps_.configStore == nullptr) {
         return;
@@ -1608,12 +1682,17 @@ void MainWindow::ApplyConfigurationFromStore() {
     const core::AppConfig& config = deps_.configStore->Get();
     toolbar_.SetVertical(config.IsToolbarVertical());
     gl_.SetVsync(config.render.vsync);
+    // GUI 大小可能变化：先重算缩放再重排
+    ApplyUiScale();
     Relayout();
     SyncToolbarState();
     morePanelDirty_ = true;
-    VB_INFO("设置已应用: 功能栏=%s, 垂直同步=%s, 临时目录=%ls",
-            config.IsToolbarVertical() ? "两侧" : "底部", config.render.vsync ? "开" : "关",
-            deps_.configStore->PhotoDir().c_str());
+    const std::string guiScaleText = config.guiScaleAuto
+                                         ? std::string("自适应")
+                                         : FormatA("%.0f%%", config.guiScale * 100.0);
+    VB_INFO("设置已应用: 功能栏=%s, GUI 大小=%s, 垂直同步=%s, 临时目录=%ls",
+            config.IsToolbarVertical() ? "两侧" : "底部", guiScaleText.c_str(),
+            config.render.vsync ? "开" : "关", deps_.configStore->PhotoDir().c_str());
 }
 
 void MainWindow::HandleMorePanelHit(const MorePanelHit& hit) {

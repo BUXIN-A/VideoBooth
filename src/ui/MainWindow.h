@@ -12,6 +12,7 @@
 #include "capture/Camera.h"
 #include "core/AppState.h"
 #include "core/Config.h"
+#include "core/UpdateChecker.h"
 #include "render/GlContext.h"
 #include "render/GlRenderer.h"
 #include "ui/AlbumPanel.h"
@@ -112,6 +113,10 @@ private:
     std::wstring PhotoDirectory() const;
     // 当前是否应保持采集（锁定画面或正在查看照片时停止拉流）
     bool ShouldCapture() const;
+    // 依据 DPI 与配置的 GUI 大小档位计算界面缩放
+    float ComputeUiScale() const;
+    // 重新计算界面缩放并应用到各界面组件
+    void ApplyUiScale();
 
     // 相册
     bool AlbumPhotoShown() const { return !albumShownPath_.empty(); }
@@ -186,6 +191,7 @@ private:
     uint64_t lastFrameIndex_ = 0;
 
     float uiScale_ = 1.0f;
+    float dpiScale_ = 1.0f; // 系统 DPI 对应的基础缩放
     int clientWidth_ = 0;
     int clientHeight_ = 0;
 
@@ -215,6 +221,9 @@ private:
     // 后台 JPG 保存线程（拍照等整帧编码不再阻塞界面）
     img::JpegSaveQueue saveQueue_;
     unsigned long long lastSaveCompleted_ = 0;
+
+    // 检查更新（后台请求 GitHub 最新 release，结果由设置面板「关于」页展示）
+    core::UpdateChecker updateChecker_;
 
     bool toolbarDirty_ = true;
     bool morePanelDirty_ = true;

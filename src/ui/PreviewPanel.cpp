@@ -35,14 +35,81 @@ void PreviewPanel::SetScale(float uiScale) {
     scale_ = std::max(0.5f, uiScale);
 }
 
-void PreviewPanel::Layout(int windowHeight) {
+void PreviewPanel::Layout(int windowWidth, int windowHeight, const RECT& toolbarBounds) {
+    windowWidth_ = windowWidth;
+    windowHeight_ = windowHeight;
+    toolbarBounds_ = toolbarBounds;
+
     const int margin = static_cast<int>(18.0f * scale_);
     const int panelWidth = static_cast<int>(300.0f * scale_);
     const int panelHeight = static_cast<int>(210.0f * scale_);
-    const int left = margin;
-    const int top = std::max(margin, windowHeight - margin - panelHeight);
+
+    // 可用区域：窗口内缩边距，并按功能栏位置收缩，避免两者相互遮挡
+    int availLeft = margin;
+    int availTop = margin;
+    int availRight = windowWidth - margin;
+    int availBottom = windowHeight - margin;
+    const bool toolbarVertical =
+        (toolbarBounds.right - toolbarBounds.left) < (toolbarBounds.bottom - toolbarBounds.top);
+    if (toolbarVertical) {
+        // 纵向功能栏贴在右侧
+        if (toolbarBounds.left > windowWidth / 2) {
+            availRight = std::min(availRight, static_cast<int>(toolbarBounds.left) - margin);
+        } else {
+            availLeft = std::max(availLeft, static_cast<int>(toolbarBounds.right) + margin);
+        }
+    } else {
+        availBottom = std::min(availBottom, static_cast<int>(toolbarBounds.top) - margin);
+    }
+
+    // 默认贴可用区域左下角，再叠加拖动偏移并收敛到可用区域内
+    const int maxLeft = std::max(availLeft, availRight - panelWidth);
+    const int maxTop = std::max(availTop, availBottom - panelHeight);
+    int left = availLeft + positionOffsetX_;
+    int top = availBottom - panelHeight + positionOffsetY_;
+    left = std::max(availLeft, std::min(left, maxLeft));
+    top = std::max(availTop, std::min(top, maxTop));
+
+    // 偏移回写为收敛后的值，使拖动始终落在可用区域内
+    positionOffsetX_ = left - availLeft;
+    positionOffsetY_ = top - (availBottom - panelHeight);
+
+    const int previousWidth = bounds_.right - bounds_.left;
+    const int previousHeight = bounds_.bottom - bounds_.top;
     bounds_ = {left, top, left + panelWidth, top + panelHeight};
-    dirty_ = true;
+    // 位置变化不影响画布内容，仅尺寸变化时需要重绘
+    if (previousWidth != panelWidth || previousHeight != panelHeight) {
+        dirty_ = true;
+    }
+}
+
+bool PreviewPanel::ContainsPoint(POINT point) const {
+    if (bounds_.right <= bounds_.left || bounds_.bottom <= bounds_.top) {
+        return false;
+    }
+    return point.x >= bounds_.left && point.x < bounds_.right && point.y >= bounds_.top &&
+           point.y < bounds_.bottom;
+}
+
+void PreviewPanel::BeginPositionDrag(int x, int y) {
+    positionDragging_ = true;
+    dragOrigin_.x = x;
+    dragOrigin_.y = y;
+    dragStartOffsetX_ = positionOffsetX_;
+    dragStartOffsetY_ = positionOffsetY_;
+}
+
+void PreviewPanel::DragPosition(int x, int y) {
+    if (!positionDragging_ || windowWidth_ <= 0 || windowHeight_ <= 0) {
+        return;
+    }
+    positionOffsetX_ = dragStartOffsetX_ + (x - dragOrigin_.x);
+    positionOffsetY_ = dragStartOffsetY_ + (y - dragOrigin_.y);
+    Layout(windowWidth_, windowHeight_, toolbarBounds_);
+}
+
+void PreviewPanel::EndPositionDrag() {
+    positionDragging_ = false;
 }
 
 void PreviewPanel::SetView(const PreviewView& view) {

@@ -6,7 +6,7 @@ namespace vb {
 namespace core {
 
 // 程序版本号 / 配置文件版本号
-inline constexpr const char* kAppVersion = "1.0.0";
+inline constexpr const char* kAppVersion = "1.1.0";
 inline constexpr int kConfigVersion = 1;
 
 struct CameraConfig {
@@ -29,6 +29,9 @@ struct AppConfig {
     std::string toolbarPosition = "bottom";   // bottom | sides
     std::wstring tempFolder;                  // 空表示使用默认临时目录
     bool saveLog = false;                     // 是否把运行日志写入日志文件
+    // GUI 大小：guiScaleAuto 为真时随窗口尺寸自适应，否则使用 guiScale 固定倍率
+    bool guiScaleAuto = true;
+    double guiScale = 1.0;
     CameraConfig camera;
     RenderConfig render;
 

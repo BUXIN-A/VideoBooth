@@ -21,6 +21,9 @@ constexpr int kMinWidth = 160;
 constexpr int kMaxWidth = 7680;
 constexpr int kMinHeight = 120;
 constexpr int kMaxHeight = 4320;
+// GUI 大小倍率的合法区间
+constexpr double kMinGuiScale = 0.75;
+constexpr double kMaxGuiScale = 2.0;
 
 bool ReadAllBytes(const std::wstring& path, std::string& out) {
     out.clear();
@@ -117,6 +120,28 @@ int IntField(const json::Value& object, const char* key, int fallback, int minVa
     return parsed;
 }
 
+double NumberField(const json::Value& object, const char* key, double fallback, double minValue,
+                   double maxValue, bool& repaired) {
+    const json::Value* value = object.Find(key);
+    if (value == nullptr) {
+        repaired = true;
+        return fallback;
+    }
+    if (!value->IsNumber()) {
+        repaired = true;
+        VB_WARN("配置字段 %s 类型非法，已使用默认值", key);
+        return fallback;
+    }
+    const double parsed = value->AsNumber(fallback);
+    if (parsed < minValue || parsed > maxValue) {
+        repaired = true;
+        VB_WARN("配置字段 %s 超出范围 [%.2f, %.2f]，已使用默认值 %.2f", key, minValue, maxValue,
+                fallback);
+        return fallback;
+    }
+    return parsed;
+}
+
 const json::Value& SubObject(const json::Value& root, const char* key, bool& repaired) {
     static const json::Value kEmpty;
     const json::Value* value = root.Find(key);
@@ -134,6 +159,8 @@ json::Value ToJson(const AppConfig& config) {
     root.Set("toolbarPosition", json::Value(config.toolbarPosition));
     root.Set("tempFolder", json::Value(WideToUtf8(config.tempFolder)));
     root.Set("saveLog", json::Value(config.saveLog));
+    root.Set("guiScaleAuto", json::Value(config.guiScaleAuto));
+    root.Set("guiScale", json::Value(config.guiScale));
 
     json::Value camera = json::Value::MakeObject();
     camera.Set("defaultCamera", json::Value(WideToUtf8(config.camera.defaultCamera)));
@@ -242,6 +269,8 @@ bool ConfigStore::Load() {
     }
     config.tempFolder = Utf8ToWide(StringField(root, "tempFolder", "", repaired));
     config.saveLog = BoolField(root, "saveLog", false, repaired);
+    config.guiScaleAuto = BoolField(root, "guiScaleAuto", true, repaired);
+    config.guiScale = NumberField(root, "guiScale", 1.0, kMinGuiScale, kMaxGuiScale, repaired);
 
     const json::Value& camera = SubObject(root, "camera", repaired);
     config.camera.defaultCamera =
@@ -309,6 +338,7 @@ bool ConfigStore::Apply(const AppConfig& config) {
     config_.camera.fps = std::max(kMinFps, std::min(kMaxFps, config_.camera.fps));
     config_.camera.width = std::max(kMinWidth, std::min(kMaxWidth, config_.camera.width));
     config_.camera.height = std::max(kMinHeight, std::min(kMaxHeight, config_.camera.height));
+    config_.guiScale = std::max(kMinGuiScale, std::min(kMaxGuiScale, config_.guiScale));
 
     std::wstring photoDir;
     ResolvePhotoDir(photoDir);
