@@ -6,7 +6,7 @@ namespace vb {
 namespace core {
 
 // 程序版本号 / 配置文件版本号
-inline constexpr const char* kAppVersion = "0.1.0";
+inline constexpr const char* kAppVersion = "1.0.0";
 inline constexpr int kConfigVersion = 1;
 
 struct CameraConfig {

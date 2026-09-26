@@ -13,7 +13,7 @@ namespace core {
 namespace {
 
 constexpr wchar_t kSingleInstanceMutex[] = L"Global\\VideoBooth.SingleInstance.v1";
-constexpr int kSplashMinimumDurationMs = 3000;
+constexpr int kSplashMinimumDurationMs = 2000;
 
 } // namespace
 

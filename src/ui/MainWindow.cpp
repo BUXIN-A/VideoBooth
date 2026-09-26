@@ -32,6 +32,8 @@ constexpr ULONGLONG kCameraMaintainIntervalMs = 2000;
 constexpr ULONGLONG kPreviewRefreshIntervalMs = 45;
 constexpr ULONGLONG kToastDurationMs = 2000;
 constexpr int kPhotoJpegQuality = 85;
+// 拍照反馈：全屏白闪时长（渐隐）
+constexpr ULONGLONG kFlashDurationMs = 150;
 
 const gfx::Color kBackdrop(0.07f, 0.07f, 0.07f, 1.0f);
 
@@ -518,6 +520,19 @@ void MainWindow::OnRender() {
     UploadSettingsTexture();
     if (settingsDialog_.isOpen() && settingsTexture_.valid()) {
         renderer_.DrawTexture(settingsTexture_, settingsDialog_.bounds());
+    }
+
+    // 拍照反馈：全屏白闪渐隐，覆盖所有界面元素
+    if (flashStartMs_ != 0) {
+        const ULONGLONG elapsed = now - flashStartMs_;
+        if (elapsed >= kFlashDurationMs) {
+            flashStartMs_ = 0;
+        } else {
+            const float alpha =
+                1.0f - static_cast<float>(elapsed) / static_cast<float>(kFlashDurationMs);
+            const RECT full = {0, 0, width, height};
+            renderer_.DrawSolid(full, gfx::Color(1.0f, 1.0f, 1.0f, alpha));
+        }
     }
 
     gl_.Present();
@@ -2049,7 +2064,8 @@ void MainWindow::CapturePhoto() {
     }
     VB_INFO("拍照已提交保存%s: %ls (%dx%d)", hasAnnotation ? "（笔迹单独存放）" : "",
             path.c_str(), pictureWidth_, pictureHeight_);
-    ShowToast(L"照片已保存");
+    // 以全屏白闪作为拍照反馈，避免文字提示遮挡画面内容
+    flashStartMs_ = ::GetTickCount64();
     // 相册面板展开时，保存线程完成后由 OnTimer 刷新，届时新照片才会落盘
 }
 

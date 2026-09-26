@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(VideoBooth VERSION 0.1.0 LANGUAGES CXX)
+project(VideoBooth VERSION 1.0.0 LANGUAGES CXX)
 
 if(NOT MSVC)
     message(FATAL_ERROR "VideoBooth 当前仅支持 MSVC 工具链构建")

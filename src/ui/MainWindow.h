@@ -229,6 +229,7 @@ private:
     ULONGLONG lastPreviewRefresh_ = 0;
     ULONGLONG lastCameraMaintain_ = 0;
     ULONGLONG lastPresentTick_ = 0;
+    ULONGLONG flashStartMs_ = 0; // 拍照白闪的起始时刻，0 表示未触发
 };
 
 } // namespace ui
