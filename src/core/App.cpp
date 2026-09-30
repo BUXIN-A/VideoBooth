@@ -13,7 +13,7 @@ namespace core {
 namespace {
 
 constexpr wchar_t kSingleInstanceMutex[] = L"Global\\VideoBooth.SingleInstance.v1";
-constexpr int kSplashMinimumDurationMs = 2000;
+constexpr int kSplashMinimumDurationMs = 1000;
 
 } // namespace
 
@@ -268,7 +268,7 @@ void App::ApplySettings(const AppConfig& updated) {
     }
 
     if (before.render.doubleBuffer != config_.Get().render.doubleBuffer ||
-        before.render.antialias != config_.Get().render.antialias) {
+        before.render.antialiasLevel != config_.Get().render.antialiasLevel) {
         VB_WARN("双缓冲 / 抗锯齿设置已保存，将在下次启动程序时生效");
     }
 

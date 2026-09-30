@@ -22,6 +22,10 @@ public:
     bool Resize(int width, int height);
     void Release();
 
+    // 全局 GUI 字体族（留空表示使用默认字体）；所有画布共用，切换后下次绘制生效
+    static void SetFontFamily(const std::wstring& family);
+    static const std::wstring& FontFamily();
+
     bool valid() const { return bits_ != nullptr && width_ > 0 && height_ > 0; }
     int width() const { return width_; }
     int height() const { return height_; }
@@ -49,6 +53,9 @@ public:
     void DrawText(const std::wstring& text, const RECT& box, int fontPixels, COLORREF color,
                   BYTE alpha = 255,
                   UINT format = DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+
+    // 对已绘制内容做显示端增强：锐化（0 关闭）与亮度倍率（1.0 不变）
+    void ApplyImageEffect(const RECT& rect, float sharpen, float brightness);
 
     SIZE MeasureText(const std::wstring& text, int fontPixels, UINT format = DT_SINGLELINE);
 
@@ -78,6 +85,7 @@ private:
     int maskStride_ = 0;
 
     std::map<int, HFONT> fonts_;
+    std::wstring fontsFamily_; // fonts_ 缓存对应的字体族
 };
 
 } // namespace ui

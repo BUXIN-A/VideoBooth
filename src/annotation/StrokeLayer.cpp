@@ -8,18 +8,38 @@ namespace vb {
 namespace annotation {
 namespace {
 
+constexpr float kInverse255 = 1.0f / 255.0f;
+// 逻辑画面像素不超过该值时启用 2 倍超采样，限制内存占用
+constexpr int64_t kMaxSupersampleSourcePixels = 4000000;
+
 inline float ChannelOf(uint32_t argb, int shift) {
     return static_cast<float>((argb >> shift) & 0xFFu) / 255.0f;
 }
 
 } // namespace
 
+void StrokeLayer::Allocate(int width, int height) {
+    width_ = width;
+    height_ = height;
+    supersample_ =
+        (static_cast<int64_t>(width) * static_cast<int64_t>(height) <= kMaxSupersampleSourcePixels)
+            ? 2
+            : 1;
+    bufferWidth_ = width_ * supersample_;
+    bufferHeight_ = height_ * supersample_;
+    bufferStride_ = bufferWidth_ * 4;
+    pixels_.assign(static_cast<size_t>(bufferStride_) * static_cast<size_t>(bufferHeight_), 0);
+}
+
 void StrokeLayer::Reset(int width, int height) {
     if (width <= 0 || height <= 0) {
         pixels_.clear();
         width_ = 0;
         height_ = 0;
-        stride_ = 0;
+        supersample_ = 1;
+        bufferWidth_ = 0;
+        bufferHeight_ = 0;
+        bufferStride_ = 0;
         hasInk_ = false;
         pointerActive_ = false;
         dirtyValid_ = false;
@@ -28,10 +48,7 @@ void StrokeLayer::Reset(int width, int height) {
     if (width_ == width && height_ == height) {
         return;
     }
-    width_ = width;
-    height_ = height;
-    stride_ = width_ * 4;
-    pixels_.assign(static_cast<size_t>(stride_) * static_cast<size_t>(height_), 0);
+    Allocate(width, height);
     hasInk_ = false;
     pointerActive_ = false;
     InvalidateAll();
@@ -50,12 +67,48 @@ bool StrokeLayer::ImportPixels(const uint8_t* bgra, int width, int height, int s
         return false;
     }
     bool hasInk = false;
-    for (int y = 0; y < height_; ++y) {
-        const uint8_t* source = bgra + static_cast<ptrdiff_t>(y) * stride;
-        uint8_t* destination = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
-        std::memcpy(destination, source, static_cast<size_t>(width_) * 4u);
+    for (int y = 0; y < bufferHeight_; ++y) {
+        const uint8_t* source = bgra + static_cast<ptrdiff_t>(y / supersample_) * stride;
+        uint8_t* destination = pixels_.data() + static_cast<ptrdiff_t>(y) * bufferStride_;
+        if (supersample_ == 1) {
+            std::memcpy(destination, source, static_cast<size_t>(bufferStride_));
+        } else {
+            for (int x = 0; x < bufferWidth_; ++x) {
+                std::memcpy(destination + static_cast<ptrdiff_t>(x) * 4,
+                            source + static_cast<ptrdiff_t>(x / supersample_) * 4, 4);
+            }
+        }
         if (!hasInk) {
-            for (int x = 0; x < width_; ++x) {
+            for (int x = 0; x < bufferWidth_; ++x) {
+                if (destination[x * 4 + 3] != 0) {
+                    hasInk = true;
+                    break;
+                }
+            }
+        }
+    }
+    hasInk_ = hasInk;
+    pointerActive_ = false;
+    dirtyValid_ = false;
+    InvalidateAll();
+    ++version_;
+    return true;
+}
+
+bool StrokeLayer::ImportBuffer(const uint8_t* bgra, int stride) {
+    if (!valid() || bgra == nullptr) {
+        return false;
+    }
+    if (stride <= 0) {
+        stride = bufferStride_;
+    }
+    bool hasInk = false;
+    for (int y = 0; y < bufferHeight_; ++y) {
+        const uint8_t* source = bgra + static_cast<ptrdiff_t>(y) * stride;
+        uint8_t* destination = pixels_.data() + static_cast<ptrdiff_t>(y) * bufferStride_;
+        std::memcpy(destination, source, static_cast<size_t>(bufferStride_));
+        if (!hasInk) {
+            for (int x = 0; x < bufferWidth_; ++x) {
                 if (destination[x * 4 + 3] != 0) {
                     hasInk = true;
                     break;
@@ -97,16 +150,16 @@ void StrokeLayer::InvalidateAll() {
     }
     dirtyLeft_ = 0;
     dirtyTop_ = 0;
-    dirtyRight_ = width_;
-    dirtyBottom_ = height_;
+    dirtyRight_ = bufferWidth_;
+    dirtyBottom_ = bufferHeight_;
     dirtyValid_ = true;
 }
 
 void StrokeLayer::ExpandDirty(int left, int top, int right, int bottom) {
     left = std::max(0, left);
     top = std::max(0, top);
-    right = std::min(width_, right);
-    bottom = std::min(height_, bottom);
+    right = std::min(bufferWidth_, right);
+    bottom = std::min(bufferHeight_, bottom);
     if (right <= left || bottom <= top) {
         return;
     }
@@ -185,10 +238,15 @@ void StrokeLayer::Stamp(float x, float y, float radius, bool erase) {
     if (!valid()) {
         return;
     }
+    // 逻辑坐标换算到超采样缓冲坐标
+    const float scale = static_cast<float>(supersample_);
+    const float bufferX = x * scale;
+    const float bufferY = y * scale;
+    const float bufferRadius = radius * scale;
     if (erase) {
-        EraseCircle(x, y, radius);
+        EraseCircle(bufferX, bufferY, bufferRadius);
     } else {
-        BlendCircle(x, y, radius);
+        BlendCircle(bufferX, bufferY, bufferRadius);
         hasInk_ = true;
     }
     ++version_;
@@ -207,14 +265,14 @@ void StrokeLayer::BlendCircle(float centerX, float centerY, float radius) {
     const int bottom = static_cast<int>(std::ceil(centerY + radius + 1.0f));
 
     const int xStart = std::max(0, left);
-    const int xEnd = std::min(width_, right);
+    const int xEnd = std::min(bufferWidth_, right);
     const int yStart = std::max(0, top);
-    const int yEnd = std::min(height_, bottom);
+    const int yEnd = std::min(bufferHeight_, bottom);
     const float outer = radius + 0.5f;
     const float outerSquared = outer * outer;
 
     for (int y = yStart; y < yEnd; ++y) {
-        uint8_t* row = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
+        uint8_t* row = pixels_.data() + static_cast<ptrdiff_t>(y) * bufferStride_;
         const float deltaY = static_cast<float>(y) + 0.5f - centerY;
         const float deltaYSquared = deltaY * deltaY;
         for (int x = xStart; x < xEnd; ++x) {
@@ -247,14 +305,14 @@ void StrokeLayer::EraseCircle(float centerX, float centerY, float radius) {
     const int bottom = static_cast<int>(std::ceil(centerY + radius + 1.0f));
 
     const int xStart = std::max(0, left);
-    const int xEnd = std::min(width_, right);
+    const int xEnd = std::min(bufferWidth_, right);
     const int yStart = std::max(0, top);
-    const int yEnd = std::min(height_, bottom);
+    const int yEnd = std::min(bufferHeight_, bottom);
     const float outer = radius + 0.5f;
     const float outerSquared = outer * outer;
 
     for (int y = yStart; y < yEnd; ++y) {
-        uint8_t* row = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
+        uint8_t* row = pixels_.data() + static_cast<ptrdiff_t>(y) * bufferStride_;
         const float deltaY = static_cast<float>(y) + 0.5f - centerY;
         const float deltaYSquared = deltaY * deltaY;
         for (int x = xStart; x < xEnd; ++x) {
@@ -279,23 +337,40 @@ void StrokeLayer::Composite(uint8_t* target, int targetStride) const {
     if (!valid() || target == nullptr || targetStride <= 0) {
         return;
     }
-    constexpr float kInverse255 = 1.0f / 255.0f;
+    const int block = supersample_;
+    const float inverseSamples = 1.0f / static_cast<float>(block * block);
     for (int y = 0; y < height_; ++y) {
-        const uint8_t* source = pixels_.data() + static_cast<ptrdiff_t>(y) * stride_;
         uint8_t* destination = target + static_cast<ptrdiff_t>(y) * targetStride;
+        const uint8_t* blockTop =
+            pixels_.data() + static_cast<ptrdiff_t>(y * block) * bufferStride_;
         for (int x = 0; x < width_; ++x) {
-            const uint8_t sourceAlpha = source[x * 4 + 3];
-            if (sourceAlpha == 0) {
+            // 超采样块均值即降采样结果（预乘数据可直接求和）
+            float sumB = 0.0f;
+            float sumG = 0.0f;
+            float sumR = 0.0f;
+            float sumA = 0.0f;
+            for (int sy = 0; sy < block; ++sy) {
+                const uint8_t* row = blockTop + static_cast<ptrdiff_t>(sy) * bufferStride_;
+                for (int sx = 0; sx < block; ++sx) {
+                    const uint8_t* sample = row + static_cast<ptrdiff_t>(x * block + sx) * 4;
+                    sumB += sample[0];
+                    sumG += sample[1];
+                    sumR += sample[2];
+                    sumA += sample[3];
+                }
+            }
+            const float sourceAlpha = sumA * inverseSamples;
+            if (sourceAlpha <= 0.0f) {
                 continue;
             }
-            const float inverse = 1.0f - static_cast<float>(sourceAlpha) * kInverse255;
+            const float inverse = 1.0f - sourceAlpha * kInverse255;
             uint8_t* pixel = destination + static_cast<ptrdiff_t>(x) * 4;
             pixel[0] = static_cast<uint8_t>(
-                std::min(255.0f, source[x * 4 + 0] + pixel[0] * inverse + 0.5f));
+                std::min(255.0f, sumB * inverseSamples + pixel[0] * inverse + 0.5f));
             pixel[1] = static_cast<uint8_t>(
-                std::min(255.0f, source[x * 4 + 1] + pixel[1] * inverse + 0.5f));
+                std::min(255.0f, sumG * inverseSamples + pixel[1] * inverse + 0.5f));
             pixel[2] = static_cast<uint8_t>(
-                std::min(255.0f, source[x * 4 + 2] + pixel[2] * inverse + 0.5f));
+                std::min(255.0f, sumR * inverseSamples + pixel[2] * inverse + 0.5f));
         }
     }
 }

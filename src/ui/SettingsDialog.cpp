@@ -17,7 +17,7 @@ namespace {
 constexpr float kWindowWidth = 640.0f;
 constexpr float kTitleBarHeight = 56.0f;
 constexpr float kTabBarHeight = 46.0f;
-constexpr float kPageHeight = 250.0f;    // 选项卡内容高度（各页一致，避免切换时窗口跳动）
+constexpr float kPageHeight = 290.0f;    // 选项卡内容高度（各页一致，避免切换时窗口跳动）
 constexpr float kPageTopPadding = 16.0f; // 页内容相对内容区顶部的留白
 constexpr float kFooterHeight = 76.0f;
 constexpr float kMargin = 22.0f;
@@ -76,6 +76,48 @@ constexpr int kFpsPresets[] = {10, 15, 20, 24, 25, 30, 50, 60};
 
 // GUI 大小档位（倍率），另有「自适应窗口」一项
 constexpr double kGuiScalePresets[] = {0.8, 0.9, 1.0, 1.1, 1.25, 1.5};
+
+// 多重采样抗锯齿等级（关闭 / 2× / 4× / 8×）
+constexpr int kAntialiasLevels[] = {0, 2, 4, 8};
+constexpr int kAntialiasLevelCount =
+    static_cast<int>(sizeof(kAntialiasLevels) / sizeof(kAntialiasLevels[0]));
+
+// 可选 GUI 字体（仅列出本机已安装的项，face 为字体名、label 为界面显示名）
+struct FontCandidate {
+    const wchar_t* face;
+    const wchar_t* label;
+};
+
+const FontCandidate kFontCandidates[] = {
+    {L"Microsoft YaHei UI", L"微软雅黑 UI"},
+    {L"Microsoft YaHei", L"微软雅黑"},
+    {L"DengXian", L"等线"},
+    {L"SimSun", L"宋体"},
+    {L"NSimSun", L"新宋体"},
+    {L"SimHei", L"黑体"},
+    {L"KaiTi", L"楷体"},
+    {L"FangSong", L"仿宋"},
+};
+
+int CALLBACK FontEnumProc(const LOGFONTW*, const TEXTMETRICW*, DWORD, LPARAM param) {
+    *reinterpret_cast<bool*>(param) = true;
+    return 0; // 返回 0 表示停止枚举
+}
+
+// 判断字体族是否已安装（按字体名精确匹配）
+bool IsFontInstalled(const wchar_t* face) {
+    HDC dc = ::GetDC(nullptr);
+    if (dc == nullptr) {
+        return false;
+    }
+    LOGFONTW filter = {};
+    filter.lfCharSet = DEFAULT_CHARSET;
+    wcsncpy_s(filter.lfFaceName, face, _TRUNCATE);
+    bool found = false;
+    ::EnumFontFamiliesExW(dc, &filter, FontEnumProc, reinterpret_cast<LPARAM>(&found), 0);
+    ::ReleaseDC(nullptr, dc);
+    return found;
+}
 
 struct ResolutionPreset {
     int width;
@@ -281,7 +323,7 @@ void SettingsDialog::BuildModel() {
 
     Choice toolbar;
     toolbar.field = Field::ToolbarPosition;
-    toolbar.items = {L"底部（横向）", L"两侧（纵向）"};
+    toolbar.items = {L"底部（横向）", L"右侧（纵向）"};
     toolbar.selected = config.IsToolbarVertical() ? 1 : 0;
     choices_.push_back(toolbar);
 
@@ -355,19 +397,20 @@ void SettingsDialog::BuildModel() {
 
     resolutionWidths_.clear();
     resolutionHeights_.clear();
+    // 首项为「原生（最大）」：0/0 表示直接使用摄像头原生最大分辨率
+    resolutionWidths_.push_back(0);
+    resolutionHeights_.push_back(0);
     for (const ResolutionPreset& preset : kResolutionPresets) {
         resolutionWidths_.push_back(preset.width);
         resolutionHeights_.push_back(preset.height);
     }
-    if (std::find(resolutionWidths_.begin(), resolutionWidths_.end(), config.camera.width) ==
-        resolutionWidths_.end()) {
-        resolutionWidths_.push_back(config.camera.width);
-        resolutionHeights_.push_back(config.camera.height);
-    }
     Choice resolution;
     resolution.field = Field::Resolution;
     for (size_t i = 0; i < resolutionWidths_.size(); ++i) {
-        resolution.items.push_back(FormatW(L"%d × %d", resolutionWidths_[i], resolutionHeights_[i]));
+        resolution.items.push_back(
+            resolutionWidths_[i] == 0
+                ? std::wstring(L"原生（最大）")
+                : FormatW(L"%d × %d", resolutionWidths_[i], resolutionHeights_[i]));
         if (resolutionWidths_[i] == config.camera.width &&
             resolutionHeights_[i] == config.camera.height) {
             resolution.selected = static_cast<int>(i);
@@ -375,10 +418,58 @@ void SettingsDialog::BuildModel() {
     }
     choices_.push_back(resolution);
 
+    Choice rotation;
+    rotation.field = Field::Rotation;
+    rotation.items = {L"默认", L"90°", L"180°", L"270°"};
+    rotation.selected = std::max(0, std::min(3, config.rotationQuarter));
+    choices_.push_back(rotation);
+
+    // GUI 字体族：仅列出本机已安装的候选项中文字体，首项为程序内置默认
+    fontFamilyNames_.clear();
+    fontFamilyNames_.emplace_back();
+    Choice font;
+    font.field = Field::FontFamily;
+    font.items.emplace_back(L"默认（微软雅黑 UI）");
+    for (const FontCandidate& candidate : kFontCandidates) {
+        if (!IsFontInstalled(candidate.face)) {
+            continue;
+        }
+        fontFamilyNames_.push_back(candidate.face);
+        font.items.emplace_back(candidate.label);
+        if (EqualsIgnoreCase(candidate.face, config.fontFamily)) {
+            font.selected = static_cast<int>(fontFamilyNames_.size()) - 1;
+        }
+    }
+    // 配置里的字体不在候选清单中时单独补一项，避免保存后被悄悄改回默认
+    if (!config.fontFamily.empty() && font.selected == 0 &&
+        !EqualsIgnoreCase(fontFamilyNames_[0], config.fontFamily)) {
+        fontFamilyNames_.push_back(config.fontFamily);
+        font.items.push_back(config.fontFamily);
+        font.selected = static_cast<int>(fontFamilyNames_.size()) - 1;
+    }
+    choices_.push_back(font);
+
+    Choice sharpen;
+    sharpen.field = Field::SharpenLevel;
+    sharpen.items = {L"关闭", L"低", L"中", L"高"};
+    sharpen.selected = std::max(0, std::min(3, config.render.sharpenLevel));
+    choices_.push_back(sharpen);
+
+    Choice antialias;
+    antialias.field = Field::AntialiasLevel;
+    for (int i = 0; i < kAntialiasLevelCount; ++i) {
+        antialias.items.push_back(kAntialiasLevels[i] == 0
+                                      ? std::wstring(L"关闭")
+                                      : FormatW(L"%d× 多重采样", kAntialiasLevels[i]));
+        if (kAntialiasLevels[i] == config.render.antialiasLevel) {
+            antialias.selected = i;
+        }
+    }
+    choices_.push_back(antialias);
+
     folderPath_ = config.tempFolder.empty() ? paths::DefaultPhotoDir() : config.tempFolder;
     autoExposure_ = config.camera.autoExposure;
     vsync_ = config.render.vsync;
-    antialias_ = config.render.antialias;
     doubleBuffer_ = config.render.doubleBuffer;
     saveLog_ = config.saveLog;
 }
@@ -446,9 +537,30 @@ bool SettingsDialog::CollectValues() {
         config.camera.height = resolutionHeights_[static_cast<size_t>(resolution->selected)];
     }
 
+    const Choice* rotation = FindChoice(Field::Rotation);
+    if (rotation != nullptr) {
+        config.rotationQuarter = std::max(0, std::min(3, rotation->selected));
+    }
+
+    const Choice* antialias = FindChoice(Field::AntialiasLevel);
+    if (antialias != nullptr && antialias->selected >= 0 &&
+        antialias->selected < kAntialiasLevelCount) {
+        config.render.antialiasLevel = kAntialiasLevels[antialias->selected];
+    }
+
+    const Choice* sharpen = FindChoice(Field::SharpenLevel);
+    if (sharpen != nullptr && sharpen->selected >= 0) {
+        config.render.sharpenLevel = std::max(0, std::min(3, sharpen->selected));
+    }
+
+    const Choice* font = FindChoice(Field::FontFamily);
+    if (font != nullptr && font->selected >= 0 &&
+        static_cast<size_t>(font->selected) < fontFamilyNames_.size()) {
+        config.fontFamily = fontFamilyNames_[static_cast<size_t>(font->selected)];
+    }
+
     config.camera.autoExposure = autoExposure_;
     config.render.vsync = vsync_;
-    config.render.antialias = antialias_;
     config.render.doubleBuffer = doubleBuffer_;
     config.saveLog = saveLog_;
 
@@ -519,16 +631,19 @@ void SettingsDialog::UpdateLayout() {
         fieldRects_[static_cast<int>(Field::GuiScale)] =
             rowRect(1, controlLeft, controlTopOffset, controlLeft + P(220.0f),
                     controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::FontFamily)] =
+            rowRect(2, controlLeft, controlTopOffset, controlLeft + P(220.0f),
+                    controlTopOffset + P(kControlHeight));
         const int browseWidth = P(kButtonWidth);
         const int pathWidth = innerRight - controlLeft - browseWidth - P(10.0f);
         fieldRects_[static_cast<int>(Field::FolderBrowse)] =
-            rowRect(2, controlLeft, controlTopOffset, controlLeft + pathWidth,
+            rowRect(3, controlLeft, controlTopOffset, controlLeft + pathWidth,
                     controlTopOffset + P(kControlHeight));
         subRects_[static_cast<int>(Field::FolderBrowse)] =
-            rowRect(2, controlLeft + pathWidth + P(10.0f), controlTopOffset, innerRight,
+            rowRect(3, controlLeft + pathWidth + P(10.0f), controlTopOffset, innerRight,
                     controlTopOffset + P(kControlHeight));
         fieldRects_[static_cast<int>(Field::SaveLog)] =
-            rowRect(3, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
+            rowRect(4, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
                     switchOffset + P(kSwitchHeight));
         break;
     }
@@ -545,15 +660,24 @@ void SettingsDialog::UpdateLayout() {
         fieldRects_[static_cast<int>(Field::AutoExposure)] =
             rowRect(3, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
                     switchOffset + P(kSwitchHeight));
+        fieldRects_[static_cast<int>(Field::Rotation)] =
+            rowRect(4, controlLeft, controlTopOffset, controlLeft + P(160.0f),
+                    controlTopOffset + P(kControlHeight));
         break;
     }
     case Tab::Render: {
-        const Field fields[] = {Field::Vsync, Field::Antialias, Field::DoubleBuffer};
-        for (int i = 0; i < 3; ++i) {
-            fieldRects_[static_cast<int>(fields[i])] =
-                rowRect(i, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
-                        switchOffset + P(kSwitchHeight));
-        }
+        fieldRects_[static_cast<int>(Field::Vsync)] =
+            rowRect(0, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
+                    switchOffset + P(kSwitchHeight));
+        fieldRects_[static_cast<int>(Field::AntialiasLevel)] =
+            rowRect(1, controlLeft, controlTopOffset, controlLeft + P(170.0f),
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::SharpenLevel)] =
+            rowRect(2, controlLeft, controlTopOffset, controlLeft + P(170.0f),
+                    controlTopOffset + P(kControlHeight));
+        fieldRects_[static_cast<int>(Field::DoubleBuffer)] =
+            rowRect(3, controlLeft, switchOffset, controlLeft + P(kSwitchWidth),
+                    switchOffset + P(kSwitchHeight));
         break;
     }
     case Tab::About: {
@@ -717,9 +841,13 @@ void SettingsDialog::Activate(const Hit& hit) {
     }
     case Field::ToolbarPosition:
     case Field::GuiScale:
+    case Field::FontFamily:
     case Field::Camera:
     case Field::Fps:
     case Field::Resolution:
+    case Field::Rotation:
+    case Field::AntialiasLevel:
+    case Field::SharpenLevel:
         openField_ = (openField_ == hit.field) ? Field::None : hit.field;
         break;
     case Field::AutoExposure:
@@ -730,9 +858,6 @@ void SettingsDialog::Activate(const Hit& hit) {
         break;
     case Field::Vsync:
         vsync_ = !vsync_;
-        break;
-    case Field::Antialias:
-        antialias_ = !antialias_;
         break;
     case Field::DoubleBuffer:
         doubleBuffer_ = !doubleBuffer_;
@@ -835,6 +960,15 @@ void SettingsDialog::DrawDropdown(const RECT& rect, const std::wstring& text, bo
                      active ? kAccent : RGB(140, 146, 156));
 }
 
+void SettingsDialog::DrawChoiceDropdown(Field field) {
+    const Choice* choice = FindChoice(field);
+    const std::wstring text =
+        choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
+            ? choice->items[static_cast<size_t>(choice->selected)]
+            : std::wstring();
+    DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
+}
+
 void SettingsDialog::DrawSwitch(const RECT& rect, bool on, bool hovered) {
     const int radius = (rect.bottom - rect.top) / 2;
     canvas_.FillRoundRect(rect, radius, on ? kAccent : kSwitchOff, hovered ? 255 : 240);
@@ -920,29 +1054,22 @@ void SettingsDialog::DrawBasicPage() {
         const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + rowIndex * kRowPitch);
         return RECT{innerLeft, baseY, innerLeft + px(kLabelWidth), baseY + px(kRowHeight)};
     };
-    const auto drawDropdown = [&](Field field) {
-        const Choice* choice = FindChoice(field);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
-    };
-
     DrawLabel(labelRect(0), L"功能栏位置");
-    drawDropdown(Field::ToolbarPosition);
+    DrawChoiceDropdown(Field::ToolbarPosition);
     DrawLabel(labelRect(1), L"GUI 大小");
-    drawDropdown(Field::GuiScale);
-    DrawLabel(labelRect(2), L"临时文件夹");
+    DrawChoiceDropdown(Field::GuiScale);
+    DrawLabel(labelRect(2), L"GUI 字体");
+    DrawChoiceDropdown(Field::FontFamily);
+    DrawLabel(labelRect(3), L"临时文件夹");
     DrawPathField(FieldRect(Field::FolderBrowse), folderPath_,
                   hover_.field == Field::FolderBrowse);
     DrawButton(subRects_[static_cast<int>(Field::FolderBrowse)], L"选择文件夹", false,
                hover_.field == Field::FolderBrowse);
-    DrawLabel(labelRect(3), L"保存运行日志");
+    DrawLabel(labelRect(4), L"保存运行日志");
     DrawSwitch(FieldRect(Field::SaveLog), saveLog_, hover_.field == Field::SaveLog);
     const RECT saveLogRect = FieldRect(Field::SaveLog);
-    const RECT saveLogHint = {saveLogRect.right + px(14.0f), labelRect(3).top,
-                              windowWidth_ - px(kMargin) - px(kCardPaddingX), labelRect(3).bottom};
+    const RECT saveLogHint = {saveLogRect.right + px(14.0f), labelRect(4).top,
+                              windowWidth_ - px(kMargin) - px(kCardPaddingX), labelRect(4).bottom};
     canvas_.DrawText(L"关闭后不再写入日志文件", saveLogHint, px(13.0f), kHintColor, 255,
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
@@ -957,24 +1084,17 @@ void SettingsDialog::DrawVideoPage() {
         const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + rowIndex * kRowPitch);
         return RECT{innerLeft, baseY, innerLeft + px(kLabelWidth), baseY + px(kRowHeight)};
     };
-    const auto drawDropdown = [&](Field field) {
-        const Choice* choice = FindChoice(field);
-        const std::wstring text =
-            choice != nullptr && choice->selected < static_cast<int>(choice->items.size())
-                ? choice->items[static_cast<size_t>(choice->selected)]
-                : std::wstring();
-        DrawDropdown(FieldRect(field), text, DropdownExpanded(field), hover_.field == field);
-    };
-
     DrawLabel(labelRect(0), L"默认摄像头");
-    drawDropdown(Field::Camera);
+    DrawChoiceDropdown(Field::Camera);
     DrawLabel(labelRect(1), L"摄像头刷新率");
-    drawDropdown(Field::Fps);
+    DrawChoiceDropdown(Field::Fps);
     DrawLabel(labelRect(2), L"摄像头分辨率");
-    drawDropdown(Field::Resolution);
+    DrawChoiceDropdown(Field::Resolution);
     DrawLabel(labelRect(3), L"自动曝光");
     DrawSwitch(FieldRect(Field::AutoExposure), autoExposure_,
                hover_.field == Field::AutoExposure);
+    DrawLabel(labelRect(4), L"默认旋转方向");
+    DrawChoiceDropdown(Field::Rotation);
 }
 
 void SettingsDialog::DrawRenderPage() {
@@ -984,22 +1104,34 @@ void SettingsDialog::DrawRenderPage() {
 
     const int innerLeft = px(kMargin) + px(kCardPaddingX);
     const int innerRight = windowWidth_ - px(kMargin) - px(kCardPaddingX);
-    const wchar_t* labels[] = {L"垂直同步", L"抗锯齿（多重采样）", L"双缓冲"};
-    const Field fields[] = {Field::Vsync, Field::Antialias, Field::DoubleBuffer};
-    const bool values[] = {vsync_, antialias_, doubleBuffer_};
-    for (int i = 0; i < 3; ++i) {
-        const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + i * kRowPitch);
-        const RECT labelRect = {innerLeft, baseY, innerLeft + px(kLabelWidth),
-                                baseY + px(kRowHeight)};
-        DrawLabel(labelRect, labels[i]);
-        const RECT rect = FieldRect(fields[i]);
-        DrawSwitch(rect, values[i], hover_.field == fields[i]);
-        if (i > 0) {
-            const RECT hint = {rect.right + px(14.0f), baseY, innerRight, baseY + px(kRowHeight)};
-            canvas_.DrawText(L"（需重启程序生效）", hint, px(13.0f), kHintColor, 255,
-                             DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        }
-    }
+    const auto labelRect = [&](int rowIndex) {
+        const int baseY = bodyTop_ - scrollY_ + px(kPageTopPadding + rowIndex * kRowPitch);
+        return RECT{innerLeft, baseY, innerLeft + px(kLabelWidth), baseY + px(kRowHeight)};
+    };
+
+    DrawLabel(labelRect(0), L"垂直同步");
+    DrawSwitch(FieldRect(Field::Vsync), vsync_, hover_.field == Field::Vsync);
+
+    DrawLabel(labelRect(1), L"抗锯齿");
+    DrawChoiceDropdown(Field::AntialiasLevel);
+    const RECT aaHint = {FieldRect(Field::AntialiasLevel).right + px(14.0f), labelRect(1).top,
+                         innerRight, labelRect(1).bottom};
+    canvas_.DrawText(L"（需重启程序生效）", aaHint, px(13.0f), kHintColor, 255,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DrawLabel(labelRect(2), L"锐化");
+    DrawChoiceDropdown(Field::SharpenLevel);
+    const RECT sharpenHint = {FieldRect(Field::SharpenLevel).right + px(14.0f), labelRect(2).top,
+                              innerRight, labelRect(2).bottom};
+    canvas_.DrawText(L"（仅影响显示，文字更清晰）", sharpenHint, px(13.0f), kHintColor, 255,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+
+    DrawLabel(labelRect(3), L"双缓冲");
+    DrawSwitch(FieldRect(Field::DoubleBuffer), doubleBuffer_, hover_.field == Field::DoubleBuffer);
+    const RECT dbHint = {FieldRect(Field::DoubleBuffer).right + px(14.0f), labelRect(3).top,
+                         innerRight, labelRect(3).bottom};
+    canvas_.DrawText(L"（需重启程序生效）", dbHint, px(13.0f), kHintColor, 255,
+                     DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 }
 
 void SettingsDialog::DrawAboutPage() {

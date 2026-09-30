@@ -10,6 +10,7 @@
 #include <strmif.h>
 #include <wrl/client.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstring>
 
@@ -122,6 +123,101 @@ void ApplyExposure(IMFMediaSource* source, bool autoExposure) {
     }
 }
 
+// 设备原生分辨率（去重后按像素数降序），用于避免由系统缩放画面
+struct NativeSize {
+    int width = 0;
+    int height = 0;
+};
+
+std::vector<NativeSize> CollectNativeSizes(IMFSourceReader* reader) {
+    std::vector<NativeSize> sizes;
+    if (reader == nullptr) {
+        return sizes;
+    }
+    for (DWORD index = 0;; ++index) {
+        ComPtr<IMFMediaType> type;
+        if (FAILED(reader->GetNativeMediaType(kFirstVideoStream, index, type.GetAddressOf()))) {
+            break;
+        }
+        UINT32 width = 0;
+        UINT32 height = 0;
+        if (FAILED(::MFGetAttributeSize(type.Get(), MF_MT_FRAME_SIZE, &width, &height)) ||
+            width == 0 || height == 0) {
+            continue;
+        }
+        bool exists = false;
+        for (const NativeSize& size : sizes) {
+            if (size.width == static_cast<int>(width) &&
+                size.height == static_cast<int>(height)) {
+                exists = true;
+                break;
+            }
+        }
+        if (!exists) {
+            sizes.push_back(NativeSize{static_cast<int>(width), static_cast<int>(height)});
+        }
+    }
+    std::sort(sizes.begin(), sizes.end(), [](const NativeSize& a, const NativeSize& b) {
+        return static_cast<int64_t>(a.width) * a.height >
+               static_cast<int64_t>(b.width) * b.height;
+    });
+    return sizes;
+}
+
+// 在原生分辨率中挑选目标：0/0 取最大；否则精确匹配优先，其次取像素数最接近的一项
+NativeSize ChooseNativeSize(const std::vector<NativeSize>& sizes, int width, int height) {
+    if (sizes.empty()) {
+        return NativeSize{width > 0 ? width : 1280, height > 0 ? height : 720};
+    }
+    if (width <= 0 || height <= 0) {
+        return sizes.front();
+    }
+    for (const NativeSize& size : sizes) {
+        if (size.width == width && size.height == height) {
+            return size;
+        }
+    }
+    const int64_t target = static_cast<int64_t>(width) * height;
+    const NativeSize* best = &sizes.front();
+    int64_t bestDiff = -1;
+    for (const NativeSize& size : sizes) {
+        const int64_t pixels = static_cast<int64_t>(size.width) * size.height;
+        const int64_t diff = pixels > target ? pixels - target : target - pixels;
+        if (bestDiff < 0 || diff < bestDiff) {
+            bestDiff = diff;
+            best = &size;
+        }
+    }
+    return *best;
+}
+
+// 探测设备端亮度范围，供「画面调节」的亮度滑块使用（亮度属于视频处理属性）
+void QueryBrightnessRangeImpl(IMFMediaSource* source, bool* supported, long* minValue,
+                              long* maxValue) {
+    *supported = false;
+    if (source == nullptr) {
+        return;
+    }
+    ComPtr<IAMVideoProcAmp> procAmp;
+    if (FAILED(source->QueryInterface(IID_PPV_ARGS(procAmp.GetAddressOf())))) {
+        return;
+    }
+    long flags = 0;
+    long minimum = 0;
+    long maximum = 0;
+    long step = 0;
+    long defaultValue = 0;
+    long value = 0;
+    if (FAILED(procAmp->GetRange(VideoProcAmp_Brightness, &minimum, &maximum, &step,
+                                 &defaultValue, &flags)) ||
+        FAILED(procAmp->Get(VideoProcAmp_Brightness, &value, &flags)) || maximum <= minimum) {
+        return;
+    }
+    *supported = true;
+    *minValue = minimum;
+    *maxValue = maximum;
+}
+
 ComPtr<IMFMediaType> MakeRgb32Type(int width, int height, int fps) {
     ComPtr<IMFMediaType> type;
     if (FAILED(::MFCreateMediaType(type.GetAddressOf()))) {
@@ -166,8 +262,8 @@ bool CameraCapture::Open(const std::wstring& deviceId, int width, int height, in
         std::lock_guard<std::mutex> lock(openMutex_);
         openResult_ = OpenResult::Pending;
         request_.deviceId = deviceId;
-        request_.width = width > 0 ? width : 1280;
-        request_.height = height > 0 ? height : 720;
+        request_.width = width;
+        request_.height = height;
         request_.fps = fps > 0 ? fps : 30;
         request_.autoExposure = autoExposure;
     }
@@ -242,6 +338,7 @@ void CameraCapture::Close() {
         }
     }
     open_.store(false);
+    brightnessSupported_.store(false);
 
     {
         std::lock_guard<std::mutex> lock(frameMutex_);
@@ -258,6 +355,46 @@ FramePtr CameraCapture::TakeLatest() {
     FramePtr frame = std::move(latest_);
     latest_.reset();
     return frame;
+}
+
+void CameraCapture::QueryBrightnessRange(IMFMediaSource* source) {
+    bool supported = false;
+    long minimum = 0;
+    long maximum = 100;
+    QueryBrightnessRangeImpl(source, &supported, &minimum, &maximum);
+    brightnessMin_ = minimum;
+    brightnessMax_ = maximum;
+    brightnessSupported_.store(supported);
+    if (!supported) {
+        VB_INFO("设备不支持亮度控制，亮度将改为显示端调节");
+    }
+}
+
+bool CameraCapture::SetBrightness(int percent) {
+    if (!brightnessSupported_.load()) {
+        return false;
+    }
+    percent = std::max(0, std::min(100, percent));
+    IAMVideoProcAmp* procAmp = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(sourceMutex_);
+        if (source_ != nullptr) {
+            source_->QueryInterface(IID_PPV_ARGS(&procAmp));
+        }
+    }
+    if (procAmp == nullptr) {
+        return false;
+    }
+    const long span = brightnessMax_ - brightnessMin_;
+    const long value = brightnessMin_ + span * percent / 100;
+    const HRESULT hr =
+        procAmp->Set(VideoProcAmp_Brightness, value, VideoProcAmp_Flags_Manual);
+    procAmp->Release();
+    if (FAILED(hr)) {
+        VB_WARN("设置设备亮度失败: %ls", HresultToWide(hr).c_str());
+        return false;
+    }
+    return true;
 }
 
 void CameraCapture::ThreadMain() {
@@ -357,26 +494,20 @@ bool CameraCapture::OpenOnCaptureThread(const OpenRequest& request) {
         return false;
     }
 
-    ComPtr<IMFMediaType> type = MakeRgb32Type(request.width, request.height, request.fps);
-    hr = reader_->SetCurrentMediaType(kFirstVideoStream, nullptr,
-                                      type.Get());
-    if (FAILED(hr)) {
-        // 目标分辨率不被支持时回退到设备原生分辨率
-        ComPtr<IMFMediaType> native;
-        if (SUCCEEDED(reader_->GetNativeMediaType(kFirstVideoStream, 0,
-                                                 native.GetAddressOf()))) {
-            UINT32 nativeWidth = 0;
-            UINT32 nativeHeight = 0;
-            if (SUCCEEDED(::MFGetAttributeSize(native.Get(), MF_MT_FRAME_SIZE, &nativeWidth,
-                                              &nativeHeight))) {
-                VB_WARN("采集分辨率 %dx%d 不被支持，回退到 %ux%u", request.width,
-                        request.height, nativeWidth, nativeHeight);
-                type = MakeRgb32Type(static_cast<int>(nativeWidth),
-                                     static_cast<int>(nativeHeight), request.fps);
-                hr = reader_->SetCurrentMediaType(kFirstVideoStream,
-                                                  nullptr, type.Get());
-            }
-        }
+    // 在设备原生分辨率中挑选目标：请求 0/0 时取最大，否则取精确匹配或像素数最接近的一项。
+    // 输出尺寸与原生尺寸一致时 SourceReader 只做格式转换，不再缩放，画面不会被二次降采样
+    const std::vector<NativeSize> nativeSizes = CollectNativeSizes(reader_);
+    const NativeSize target = ChooseNativeSize(nativeSizes, request.width, request.height);
+    ComPtr<IMFMediaType> type = MakeRgb32Type(target.width, target.height, request.fps);
+    hr = reader_->SetCurrentMediaType(kFirstVideoStream, nullptr, type.Get());
+    if (FAILED(hr) && !nativeSizes.empty() &&
+        (target.width != nativeSizes.front().width ||
+         target.height != nativeSizes.front().height)) {
+        // 首选分辨率不被支持时回退到设备最大原生分辨率
+        VB_WARN("采集分辨率 %dx%d 不被支持，回退到原生最大 %dx%d", target.width, target.height,
+                nativeSizes.front().width, nativeSizes.front().height);
+        type = MakeRgb32Type(nativeSizes.front().width, nativeSizes.front().height, request.fps);
+        hr = reader_->SetCurrentMediaType(kFirstVideoStream, nullptr, type.Get());
     }
     if (FAILED(hr)) {
         VB_ERROR("设置采集输出格式失败: %ls", HresultToWide(hr).c_str());
@@ -384,6 +515,7 @@ bool CameraCapture::OpenOnCaptureThread(const OpenRequest& request) {
     }
 
     ApplyExposure(source_, request.autoExposure);
+    QueryBrightnessRange(source_);
 
     // 记录实际协商到的采集分辨率，供采集循环打包帧时使用
     UINT32 actualWidth = 0;
@@ -394,8 +526,8 @@ bool CameraCapture::OpenOnCaptureThread(const OpenRequest& request) {
             ::MFGetAttributeSize(current.Get(), MF_MT_FRAME_SIZE, &actualWidth, &actualHeight);
         }
     }
-    frameWidth_ = actualWidth > 0 ? static_cast<int>(actualWidth) : request.width;
-    frameHeight_ = actualHeight > 0 ? static_cast<int>(actualHeight) : request.height;
+    frameWidth_ = actualWidth > 0 ? static_cast<int>(actualWidth) : target.width;
+    frameHeight_ = actualHeight > 0 ? static_cast<int>(actualHeight) : target.height;
     VB_INFO("摄像头已打开: %ls (%ux%u@%d, 请求 %dx%d)", deviceName_.c_str(), actualWidth,
             actualHeight, request.fps, request.width, request.height);
     return true;

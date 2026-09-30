@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstring>
+#include <utility>
 
 namespace vb {
 namespace gfx {
@@ -28,9 +29,22 @@ void main() {
 const char* kFragmentShaderSource = R"(#version 110
 uniform sampler2D uTexture;
 uniform vec4 uTint;
+// x = 锐化强度（0 关闭），y = 亮度倍率，zw = 纹素尺寸
+uniform vec4 uEffect;
 varying vec2 vTexCoord;
 void main() {
-    gl_FragColor = texture2D(uTexture, vTexCoord) * uTint;
+    vec4 texel = texture2D(uTexture, vTexCoord);
+    vec3 color = texel.rgb;
+    if (uEffect.x > 0.0) {
+        vec3 neighbors =
+            texture2D(uTexture, vTexCoord + vec2(uEffect.z, 0.0)).rgb +
+            texture2D(uTexture, vTexCoord - vec2(uEffect.z, 0.0)).rgb +
+            texture2D(uTexture, vTexCoord + vec2(0.0, uEffect.w)).rgb +
+            texture2D(uTexture, vTexCoord - vec2(0.0, uEffect.w)).rgb;
+        color = color + (color - neighbors * 0.25) * uEffect.x;
+    }
+    color *= uEffect.y;
+    gl_FragColor = vec4(clamp(color, vec3(0.0), vec3(1.0)), texel.a) * uTint;
 }
 )";
 
@@ -59,6 +73,28 @@ GLuint CompileShader(GLenum type, const char* source) {
 
 Texture::~Texture() {
     Destroy();
+}
+
+Texture::Texture(Texture&& other) noexcept
+    : id_(other.id_), width_(other.width_), height_(other.height_),
+      packed_(std::move(other.packed_)) {
+    other.id_ = 0;
+    other.width_ = 0;
+    other.height_ = 0;
+}
+
+Texture& Texture::operator=(Texture&& other) noexcept {
+    if (this != &other) {
+        Destroy();
+        id_ = other.id_;
+        width_ = other.width_;
+        height_ = other.height_;
+        packed_ = std::move(other.packed_);
+        other.id_ = 0;
+        other.width_ = 0;
+        other.height_ = 0;
+    }
+    return *this;
 }
 
 bool Texture::Upload(const uint8_t* bgra, int width, int height, int stride) {
@@ -190,6 +226,7 @@ bool GlRenderer::Init() {
     uniformViewport_ = glfn::GetUniformLocation(program_, "uViewport");
     uniformTexture_ = glfn::GetUniformLocation(program_, "uTexture");
     uniformTint_ = glfn::GetUniformLocation(program_, "uTint");
+    uniformEffect_ = glfn::GetUniformLocation(program_, "uEffect");
     attribPosition_ = glfn::GetAttribLocation(program_, "aPosition");
     attribTexCoord_ = glfn::GetAttribLocation(program_, "aTexCoord");
 
@@ -253,13 +290,21 @@ void GlRenderer::BeginFrame(int width, int height, const Color& clearColor) {
     }
 }
 
-void GlRenderer::DrawQuad(const Vertex vertices[6], const Texture& texture, const Color& tint) {
+void GlRenderer::DrawQuad(const Vertex vertices[6], const Texture& texture, const Color& tint,
+                          const ImageEffect& effect) {
     if (program_ == 0 || !texture.valid()) {
         return;
     }
     if (uniformTint_ >= 0) {
         // 预乘 alpha：颜色分量乘以 alpha
         glfn::Uniform4f(uniformTint_, tint.r * tint.a, tint.g * tint.a, tint.b * tint.a, tint.a);
+    }
+    if (uniformEffect_ >= 0) {
+        const float texelX =
+            effect.sharpen > 0.0f && texture.width() > 0 ? 1.0f / texture.width() : 0.0f;
+        const float texelY =
+            effect.sharpen > 0.0f && texture.height() > 0 ? 1.0f / texture.height() : 0.0f;
+        glfn::Uniform4f(uniformEffect_, effect.sharpen, effect.brightness, texelX, texelY);
     }
     glfn::BindBuffer(glc::kArrayBuffer, vbo_);
     glfn::BufferData(glc::kArrayBuffer, static_cast<GLsizeiptr>(sizeof(Vertex) * 6), vertices,
@@ -270,7 +315,7 @@ void GlRenderer::DrawQuad(const Vertex vertices[6], const Texture& texture, cons
 }
 
 void GlRenderer::DrawTexture(const Texture& texture, const RECT& dest, float rotationDeg,
-                            const Color& tint) {
+                            const Color& tint, const ImageEffect& effect) {
     if (!texture.valid()) {
         return;
     }
@@ -314,7 +359,7 @@ void GlRenderer::DrawTexture(const Texture& texture, const RECT& dest, float rot
     vertices[5].u = 0.0f;
     vertices[5].v = 1.0f;
 
-    DrawQuad(vertices, texture, tint);
+    DrawQuad(vertices, texture, tint, effect);
 }
 
 void GlRenderer::DrawSolid(const RECT& dest, const Color& color, float rotationDeg) {

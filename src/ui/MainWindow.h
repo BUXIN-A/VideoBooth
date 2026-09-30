@@ -15,6 +15,7 @@
 #include "core/UpdateChecker.h"
 #include "render/GlContext.h"
 #include "render/GlRenderer.h"
+#include "ui/AdjustPanel.h"
 #include "ui/AlbumPanel.h"
 #include "ui/MorePanel.h"
 #include "ui/OverlayCanvas.h"
@@ -89,12 +90,25 @@ private:
     void ShowToast(const std::wstring& text);
     void HandleToolButton(ToolButtonId id);
     void ApplyToolMode(core::ToolMode mode);
+    // 画面调节：旋转 / 锁定 / 亮度
+    void ApplyRotate();
+    void ToggleLock();
+    void ApplyBrightness(int percent);
+    void OpenAdjustPanel();
+    void HideAdjustPanel();
+    void UploadAdjustPanelTexture();
+    void HandleAdjustPanelHit(const AdjustPanelHit& hit);
+    // 显示端增强参数（锐化 + 亮度），由配置与画面调节共同决定
+    gfx::ImageEffect CurrentImageEffect() const;
+    // 字体族、锐化等级变化后重新应用到各界面组件
+    void ApplyUiFont();
     // 设置面板：直接在展台窗口内渲染（全屏窗口下独立设置窗口不可见）
     void OpenSettingsDialog();
     void FinishSettingsDialog();
     void UploadSettingsTexture();
     void HandleMorePanelHit(const MorePanelHit& hit);
-    void SyncAnnotationStyle();
+    // 把「更多」面板当前的画笔颜色/粗细/橡皮大小同步到指定笔迹层
+    void SyncAnnotationStyle(annotation::StrokeLayer& layer);
     // 笔迹按图片单独存取：照片用文件名，实时画面用固定标识（均为临时目录中的文件）
     std::wstring CurrentAnnotationKey() const;
     std::wstring AnnotationPath(const std::wstring& key) const;
@@ -134,14 +148,48 @@ private:
     void DeleteAlbumPhoto(size_t index);
     // 导出照片：withAnnotation 为真时把该照片的笔迹合成进 JPG
     bool ExportPhoto(size_t index, const std::wstring& target, bool withAnnotation);
-    // 把相册全部照片复制到所选文件夹
+    // 进入多选并保存：点「保存照片」进入勾选，点「确定」后把所选照片导出到指定文件夹
     void SaveAllAlbumPhotos();
+    void ConfirmSelectedPhotosSave();
     // 从所选图片文件导入到相册目录
     void ImportAlbumPhotos();
-    // 核心动作（与文件对话框解耦，便于复用与验证）
-    size_t ExportAlbumPhotosTo(const std::wstring& folder, bool withAnnotation);
     size_t ImportPhotoFilesFrom(const std::vector<std::wstring>& files);
     void UploadAlbumPanelTexture();
+
+    // 对比教学模式：相册面板多选后把所选照片网格平铺到画面中
+    bool ComparisonActive() const { return compareMode_ && !compareItems_.empty(); }
+    void EnterCompareMode();
+    void ExitCompareMode();
+    void SyncCompareSelectionFromPanel();
+    void ReleaseCompareItems();
+    void UploadCompareTextures();
+    void RenderCompareGrid(int windowWidth, int windowHeight);
+    // 教学网格：格子的宽高与某格中心（照片始终以所在格中心为基准）
+    struct CompareCell {
+        float width = 0.0f;
+        float height = 0.0f;
+        float centerX = 0.0f;
+        float centerY = 0.0f;
+    };
+    CompareCell CompareCellAt(size_t itemIndex, int windowWidth, int windowHeight) const;
+    // 教学网格的绘制顺序：按叠放层次 z 升序（越晚绘制越靠上）
+    std::vector<size_t> CompareDrawOrder() const;
+    // 把某张照片置于最顶层（仅改变绘制层次，不改变所在格子）
+    void BringCompareItemToFront(size_t itemIndex);
+    // 教学网格：某张照片的绘制矩形（含拖动位移与单独缩放），false 表示无有效纹理
+    bool CompareItemRect(size_t itemIndex, int windowWidth, int windowHeight, RECT& dest) const;
+    // 命中定位：返回位于该点的最上层照片下标，-1 表示未命中
+    int CompareItemAt(POINT point, int windowWidth, int windowHeight) const;
+    // 窗口坐标 → 该照片的笔迹层坐标
+    void CompareWindowToImage(size_t itemIndex, POINT point, int windowWidth, int windowHeight,
+                              float* imageX, float* imageY) const;
+    // 限制拖动位移，保证照片至少有一部分留在窗口内（可拖到边缘，也能放大后查看局部）
+    void ClampCompareOffset(size_t itemIndex, int windowWidth, int windowHeight);
+    // 以 (anchorX, anchorY) 为不动点单独缩放某张照片
+    void ZoomCompareItem(size_t itemIndex, int anchorX, int anchorY, float factor);
+    void SaveCompareAnnotation(size_t itemIndex) const;
+    void SaveCompareAnnotations() const;
+    void ClearCompareAnnotations();
 
     HINSTANCE instance_ = nullptr;
     HWND hwnd_ = nullptr;
@@ -153,6 +201,7 @@ private:
     Toolbar toolbar_;
     PreviewPanel preview_;
     MorePanel morePanel_;
+    AdjustPanel adjustPanel_;
     AlbumPanel albumPanel_;
     SettingsDialog settingsDialog_;
 
@@ -162,14 +211,49 @@ private:
     gfx::Texture previewTexture_;
     gfx::Texture toastTexture_;
     gfx::Texture morePanelTexture_;
+    gfx::Texture adjustPanelTexture_;
     gfx::Texture albumPanelTexture_;
     gfx::Texture settingsTexture_; // 设置面板
-    gfx::Texture eraserTexture_; // 橡皮擦除范围圆环
+    gfx::Texture eraserTexture_; // 橡皮擦除范围指示
     OverlayCanvas toastCanvas_;
 
     annotation::StrokeLayer annotation_;
     bool annotating_ = false;
-    bool moreSliderDrag_ = false; // 正在拖动“更多”面板的粗细滑块
+    bool moreSliderDrag_ = false;   // 正在拖动“更多”面板的粗细滑块
+    bool adjustSliderDrag_ = false; // 正在拖动「画面调节」的亮度滑块
+    // 亮度：优先设备端，设备不支持时改为显示端调节
+    int brightnessPercent_ = 50;
+    bool displayBrightness_ = false;
+    float sharpenStrength_ = 0.0f; // 由配置的锐化等级换算出的强度
+    bool adjustPanelDirty_ = true;
+    AdjustPanelHit::Kind adjustPanelHover_ = AdjustPanelHit::Kind::None;
+
+    // 对比教学模式：多选的图片在画面中网格平铺，可单独拖动并各自批注
+    struct CompareItem {
+        size_t index = 0;
+        std::wstring name;      // 照片文件名（笔迹文件以其命名）
+        img::Image image;
+        gfx::Texture texture;
+        bool dirty = true;
+        // 拖动位移与单独缩放（仅本次教学有效，不写盘）
+        float offsetX = 0.0f;
+        float offsetY = 0.0f;
+        float zoom = 1.0f;
+        int z = 0; // 叠放层次：越大越靠上（双击置顶）
+        // 每张照片各自的笔迹层（与全屏查看共用 <照片名>.ann.png）
+        annotation::StrokeLayer annotation;
+        gfx::Texture annotationTexture;
+    };
+    bool compareMode_ = false;
+    std::vector<CompareItem> compareItems_;
+    int compareDragIndex_ = -1;       // 选择模式下正在拖动的照片下标
+    POINT compareDragLast_ = {0, 0};  // 拖动上一位置（窗口坐标）
+    int compareAnnotateIndex_ = -1;   // 批注/橡皮时命中的照片下标
+    int compareTopZ_ = 0;             // 叠放层次计数（越大越靠上）
+    // 双击判定（鼠标与触摸都经 OnButtonDown，故统一在此判定）
+    ULONGLONG compareLastClickTick_ = 0;
+    POINT compareLastClickPos_ = {0, 0};
+    int compareLastClickIndex_ = -1;
 
     // 相册数据与展示状态
     album::PhotoLibrary photoLibrary_;

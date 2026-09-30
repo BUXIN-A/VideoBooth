@@ -25,6 +25,33 @@ constexpr int kMaxHeight = 4320;
 constexpr double kMinGuiScale = 0.75;
 constexpr double kMaxGuiScale = 2.0;
 
+// 抗锯齿等级仅接受 0 / 2 / 4 / 8
+bool IsValidAntialiasLevel(int level) {
+    return level == 0 || level == 2 || level == 4 || level == 8;
+}
+
+// 锐化等级仅接受 0 / 1 / 2 / 3
+bool IsValidSharpenLevel(int level) {
+    return level >= 0 && level <= 3;
+}
+
+// 采集分辨率：0/0 表示使用摄像头原生最大分辨率，其余须落在合法区间内
+bool IsValidResolutionPair(int width, int height) {
+    if (width == 0 && height == 0) {
+        return true;
+    }
+    return width >= kMinWidth && width <= kMaxWidth && height >= kMinHeight &&
+           height <= kMaxHeight;
+}
+
+// 采集分辨率的可读文本（0/0 表示原生最大）
+std::string ResolutionText(const CameraConfig& camera) {
+    if (camera.IsNativeResolution()) {
+        return "原生";
+    }
+    return FormatA("%dx%d", camera.width, camera.height);
+}
+
 bool ReadAllBytes(const std::wstring& path, std::string& out) {
     out.clear();
     HANDLE file = ::CreateFileW(path.c_str(), GENERIC_READ,
@@ -161,6 +188,8 @@ json::Value ToJson(const AppConfig& config) {
     root.Set("saveLog", json::Value(config.saveLog));
     root.Set("guiScaleAuto", json::Value(config.guiScaleAuto));
     root.Set("guiScale", json::Value(config.guiScale));
+    root.Set("rotationQuarter", json::Value(config.rotationQuarter));
+    root.Set("fontFamily", json::Value(WideToUtf8(config.fontFamily)));
 
     json::Value camera = json::Value::MakeObject();
     camera.Set("defaultCamera", json::Value(WideToUtf8(config.camera.defaultCamera)));
@@ -173,7 +202,8 @@ json::Value ToJson(const AppConfig& config) {
     json::Value render = json::Value::MakeObject();
     render.Set("vsync", json::Value(config.render.vsync));
     render.Set("doubleBuffer", json::Value(config.render.doubleBuffer));
-    render.Set("antialias", json::Value(config.render.antialias));
+    render.Set("antialiasLevel", json::Value(config.render.antialiasLevel));
+    render.Set("sharpenLevel", json::Value(config.render.sharpenLevel));
     root.Set("render", std::move(render));
     return root;
 }
@@ -257,7 +287,7 @@ bool ConfigStore::Load() {
 
     const int configVersion = IntField(root, "configVersion", kConfigVersion, 1,
                                        kConfigVersion, repaired);
-    config.configVersion = configVersion;
+    config.configVersion = kConfigVersion;
 
     const std::string position = StringField(root, "toolbarPosition", "bottom", repaired);
     if (position == "bottom" || position == "sides") {
@@ -271,19 +301,41 @@ bool ConfigStore::Load() {
     config.saveLog = BoolField(root, "saveLog", false, repaired);
     config.guiScaleAuto = BoolField(root, "guiScaleAuto", true, repaired);
     config.guiScale = NumberField(root, "guiScale", 1.0, kMinGuiScale, kMaxGuiScale, repaired);
+    config.rotationQuarter = IntField(root, "rotationQuarter", 0, 0, 3, repaired);
+    config.fontFamily = Utf8ToWide(StringField(root, "fontFamily", "", repaired));
 
     const json::Value& camera = SubObject(root, "camera", repaired);
     config.camera.defaultCamera =
         Utf8ToWide(StringField(camera, "defaultCamera", "", repaired));
     config.camera.fps = IntField(camera, "fps", 30, kMinFps, kMaxFps, repaired);
-    config.camera.width = IntField(camera, "width", 1920, kMinWidth, kMaxWidth, repaired);
-    config.camera.height = IntField(camera, "height", 1080, kMinHeight, kMaxHeight, repaired);
+    config.camera.width = IntField(camera, "width", 0, 0, kMaxWidth, repaired);
+    config.camera.height = IntField(camera, "height", 0, 0, kMaxHeight, repaired);
+    // 版本 2 之前默认按固定分辨率采集，升级后重置为原生，避免系统缩放导致画面模糊
+    if (configVersion < 2 && !config.camera.IsNativeResolution()) {
+        VB_INFO("旧配置采集分辨率 %dx%d 已重置为原生最大分辨率", config.camera.width,
+                config.camera.height);
+        config.camera.width = 0;
+        config.camera.height = 0;
+        repaired = true;
+    }
+    if (!IsValidResolutionPair(config.camera.width, config.camera.height)) {
+        VB_WARN("采集分辨率 %dx%d 非法，已回退为原生最大分辨率", config.camera.width,
+                config.camera.height);
+        config.camera.width = 0;
+        config.camera.height = 0;
+        repaired = true;
+    }
     config.camera.autoExposure = BoolField(camera, "autoExposure", false, repaired);
 
     const json::Value& render = SubObject(root, "render", repaired);
     config.render.vsync = BoolField(render, "vsync", false, repaired);
     config.render.doubleBuffer = BoolField(render, "doubleBuffer", true, repaired);
-    config.render.antialias = BoolField(render, "antialias", false, repaired);
+    config.render.antialiasLevel = IntField(render, "antialiasLevel", 0, 0, 8, repaired);
+    if (!IsValidAntialiasLevel(config.render.antialiasLevel)) {
+        config.render.antialiasLevel = 0;
+        repaired = true;
+    }
+    config.render.sharpenLevel = IntField(render, "sharpenLevel", 0, 0, 3, repaired);
 
     config_ = config;
 
@@ -298,9 +350,9 @@ bool ConfigStore::Load() {
         VB_INFO("配置已合并默认值并写回磁盘");
         Save();
     }
-    VB_INFO("配置加载完成: 摄像头=%ls, %dx%d@%dfps, 功能栏=%s, 临时目录=%ls",
+    VB_INFO("配置加载完成: 摄像头=%ls, %s@%dfps, 功能栏=%s, 临时目录=%ls",
             config_.camera.defaultCamera.empty() ? L"(未指定)" : config_.camera.defaultCamera.c_str(),
-            config_.camera.width, config_.camera.height, config_.camera.fps,
+            ResolutionText(config_.camera).c_str(), config_.camera.fps,
             config_.toolbarPosition.c_str(), photoDir_.c_str());
     return true;
 }
@@ -336,21 +388,32 @@ bool ConfigStore::Apply(const AppConfig& config) {
         config_.toolbarPosition = "bottom";
     }
     config_.camera.fps = std::max(kMinFps, std::min(kMaxFps, config_.camera.fps));
-    config_.camera.width = std::max(kMinWidth, std::min(kMaxWidth, config_.camera.width));
-    config_.camera.height = std::max(kMinHeight, std::min(kMaxHeight, config_.camera.height));
+    if (!IsValidResolutionPair(config_.camera.width, config_.camera.height)) {
+        config_.camera.width = 0;
+        config_.camera.height = 0;
+    }
     config_.guiScale = std::max(kMinGuiScale, std::min(kMaxGuiScale, config_.guiScale));
+    config_.rotationQuarter = std::max(0, std::min(3, config_.rotationQuarter));
+    if (!IsValidAntialiasLevel(config_.render.antialiasLevel)) {
+        config_.render.antialiasLevel = 0;
+    }
+    if (!IsValidSharpenLevel(config_.render.sharpenLevel)) {
+        config_.render.sharpenLevel = 0;
+    }
 
     std::wstring photoDir;
     ResolvePhotoDir(photoDir);
     photoDir_ = photoDir;
 
-    VB_INFO("设置已写入: 摄像头=%ls, %dx%d@%dfps, 自动曝光=%d, 功能栏=%s, 垂直同步=%d, "
-            "双缓冲=%d, 抗锯齿=%d, 保存日志=%d, 临时目录=%ls",
+    VB_INFO("设置已写入: 摄像头=%ls, %s@%dfps, 自动曝光=%d, 功能栏=%s, 垂直同步=%d, "
+            "双缓冲=%d, 抗锯齿=%d, 锐化=%d, 字体=%ls, 保存日志=%d, 临时目录=%ls",
             config_.camera.defaultCamera.empty() ? L"(自动)" : config_.camera.defaultCamera.c_str(),
-            config_.camera.width, config_.camera.height, config_.camera.fps,
+            ResolutionText(config_.camera).c_str(), config_.camera.fps,
             config_.camera.autoExposure ? 1 : 0, config_.toolbarPosition.c_str(),
             config_.render.vsync ? 1 : 0, config_.render.doubleBuffer ? 1 : 0,
-            config_.render.antialias ? 1 : 0, config_.saveLog ? 1 : 0, photoDir_.c_str());
+            config_.render.antialiasLevel, config_.render.sharpenLevel,
+            config_.fontFamily.empty() ? L"(默认)" : config_.fontFamily.c_str(),
+            config_.saveLog ? 1 : 0, photoDir_.c_str());
     return Save();
 }
 

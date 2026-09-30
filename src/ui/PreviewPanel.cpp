@@ -24,6 +24,7 @@ bool SameView(const PreviewView& a, const PreviewView& b) {
            a.rotationQuarter == b.rotationQuarter && a.windowWidth == b.windowWidth &&
            a.windowHeight == b.windowHeight && a.scale == b.scale &&
            a.offsetX == b.offsetX && a.offsetY == b.offsetY && a.interactive == b.interactive &&
+           a.sharpen == b.sharpen && a.brightness == b.brightness &&
            a.overlayPixels == b.overlayPixels && a.overlayWidth == b.overlayWidth &&
            a.overlayHeight == b.overlayHeight && a.overlayStride == b.overlayStride &&
            a.overlayVersion == b.overlayVersion;
@@ -35,44 +36,26 @@ void PreviewPanel::SetScale(float uiScale) {
     scale_ = std::max(0.5f, uiScale);
 }
 
-void PreviewPanel::Layout(int windowWidth, int windowHeight, const RECT& toolbarBounds) {
+void PreviewPanel::Layout(int windowWidth, int windowHeight) {
     windowWidth_ = windowWidth;
     windowHeight_ = windowHeight;
-    toolbarBounds_ = toolbarBounds;
 
     const int margin = static_cast<int>(18.0f * scale_);
     const int panelWidth = static_cast<int>(300.0f * scale_);
     const int panelHeight = static_cast<int>(210.0f * scale_);
 
-    // 可用区域：窗口内缩边距，并按功能栏位置收缩，避免两者相互遮挡
-    int availLeft = margin;
-    int availTop = margin;
-    int availRight = windowWidth - margin;
-    int availBottom = windowHeight - margin;
-    const bool toolbarVertical =
-        (toolbarBounds.right - toolbarBounds.left) < (toolbarBounds.bottom - toolbarBounds.top);
-    if (toolbarVertical) {
-        // 纵向功能栏贴在右侧
-        if (toolbarBounds.left > windowWidth / 2) {
-            availRight = std::min(availRight, static_cast<int>(toolbarBounds.left) - margin);
-        } else {
-            availLeft = std::max(availLeft, static_cast<int>(toolbarBounds.right) + margin);
-        }
-    } else {
-        availBottom = std::min(availBottom, static_cast<int>(toolbarBounds.top) - margin);
-    }
+    // 边界为窗口边缘（允许与功能栏重叠，功能栏绘制在预览框之上）
+    const int maxLeft = std::max(0, windowWidth - panelWidth);
+    const int maxTop = std::max(0, windowHeight - panelHeight);
+    const int defaultLeft = margin;
+    const int defaultTop = windowHeight - margin - panelHeight;
 
-    // 默认贴可用区域左下角，再叠加拖动偏移并收敛到可用区域内
-    const int maxLeft = std::max(availLeft, availRight - panelWidth);
-    const int maxTop = std::max(availTop, availBottom - panelHeight);
-    int left = availLeft + positionOffsetX_;
-    int top = availBottom - panelHeight + positionOffsetY_;
-    left = std::max(availLeft, std::min(left, maxLeft));
-    top = std::max(availTop, std::min(top, maxTop));
+    const int left = std::max(0, std::min(defaultLeft + positionOffsetX_, maxLeft));
+    const int top = std::max(0, std::min(defaultTop + positionOffsetY_, maxTop));
 
-    // 偏移回写为收敛后的值，使拖动始终落在可用区域内
-    positionOffsetX_ = left - availLeft;
-    positionOffsetY_ = top - (availBottom - panelHeight);
+    // 偏移回写为收敛后的值，使拖动始终落在窗口范围内
+    positionOffsetX_ = left - defaultLeft;
+    positionOffsetY_ = top - defaultTop;
 
     const int previousWidth = bounds_.right - bounds_.left;
     const int previousHeight = bounds_.bottom - bounds_.top;
@@ -105,7 +88,7 @@ void PreviewPanel::DragPosition(int x, int y) {
     }
     positionOffsetX_ = dragStartOffsetX_ + (x - dragOrigin_.x);
     positionOffsetY_ = dragStartOffsetY_ + (y - dragOrigin_.y);
-    Layout(windowWidth_, windowHeight_, toolbarBounds_);
+    Layout(windowWidth_, windowHeight_);
 }
 
 void PreviewPanel::EndPositionDrag() {
@@ -171,8 +154,9 @@ bool PreviewPanel::Update() {
     canvas_.FillRect(imageRect, kLetterboxColor, 255);
     canvas_.DrawPixels(view_.pixels, view_.imageWidth, view_.imageHeight, view_.stride, imageRect,
                        rotateQuarter, 255);
-    if (view_.overlayPixels != nullptr && view_.overlayWidth == view_.imageWidth &&
-        view_.overlayHeight == view_.imageHeight) {
+    // 与主画面一致地应用锐化 / 显示端亮度（不影响笔迹层）
+    canvas_.ApplyImageEffect(imageRect, view_.sharpen, view_.brightness);
+    if (view_.overlayPixels != nullptr && view_.overlayWidth > 0 && view_.overlayHeight > 0) {
         canvas_.DrawPixels(view_.overlayPixels, view_.overlayWidth, view_.overlayHeight,
                            view_.overlayStride, imageRect, rotateQuarter, 255);
     }

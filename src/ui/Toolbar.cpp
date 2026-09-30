@@ -16,16 +16,15 @@ const ToolButton kButtons[] = {
     {ToolButtonId::Select, L"pointer.png", L"选择"},
     {ToolButtonId::Annotate, L"pen.png", L"批注"},
     {ToolButtonId::Erase, L"eraser.png", L"橡皮"},
-    {ToolButtonId::Rotate, L"spin.png", L"旋转"},
-    {ToolButtonId::Lock, L"lock.png", L"锁定"},
     {ToolButtonId::Shoot, L"shoot.png", L"拍照"},
     {ToolButtonId::Album, L"album.png", L"相册"},
+    {ToolButtonId::Adjust, L"adjustment.png", L"画面调节"},
     {ToolButtonId::Settings, L"setting.png", L"设置"},
     {ToolButtonId::Minimize, L"minimize.png", L"最小化"},
     {ToolButtonId::Exit, L"exit.png", L"退出"},
 };
 
-constexpr int kGroupBoundaries[] = {2, 6}; // 在这些索引之后增加组间距
+constexpr int kGroupBoundaries[] = {2, 5}; // 在这些索引之后增加组间距
 
 bool IsGroupBoundary(int index) {
     for (const int boundary : kGroupBoundaries) {

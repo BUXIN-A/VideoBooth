@@ -6,21 +6,26 @@ namespace vb {
 namespace core {
 
 // 程序版本号 / 配置文件版本号
-inline constexpr const char* kAppVersion = "1.1.0";
-inline constexpr int kConfigVersion = 1;
+inline constexpr const char* kAppVersion = "1.2.0";
+// 版本 2：采集分辨率默认改为“原生（最大）”，旧配置升级时重置为原生
+inline constexpr int kConfigVersion = 2;
 
 struct CameraConfig {
     std::wstring defaultCamera;   // 设备符号链接，空表示未指定
     int fps = 30;                 // 采集刷新率
-    int width = 1920;             // 采集分辨率
-    int height = 1080;
+    // 采集分辨率：0/0 表示使用摄像头原生最大分辨率（避免系统缩放导致画面变模糊）
+    int width = 0;
+    int height = 0;
     bool autoExposure = false;    // 默认关闭自动曝光
+
+    bool IsNativeResolution() const { return width <= 0 || height <= 0; }
 };
 
 struct RenderConfig {
     bool vsync = false;           // 默认关闭垂直同步
     bool doubleBuffer = true;     // 默认开启双缓冲
-    bool antialias = false;       // 多重采样抗锯齿（需重启程序生效）
+    int antialiasLevel = 0;       // 多重采样抗锯齿采样数（0 / 2 / 4 / 8，需重启程序生效）
+    int sharpenLevel = 0;         // 画面锐化强度（0 关闭 / 1 低 / 2 中 / 3 高）
 };
 
 struct AppConfig {
@@ -32,6 +37,10 @@ struct AppConfig {
     // GUI 大小：guiScaleAuto 为真时随窗口尺寸自适应，否则使用 guiScale 固定倍率
     bool guiScaleAuto = true;
     double guiScale = 1.0;
+    // 启动时的默认画面旋转：0 = 默认，1 = 90°，2 = 180°，3 = 270°
+    int rotationQuarter = 0;
+    // GUI 字体族（系统已安装的字体名，留空使用默认字体）
+    std::wstring fontFamily;
     CameraConfig camera;
     RenderConfig render;
 

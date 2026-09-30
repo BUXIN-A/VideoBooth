@@ -204,16 +204,13 @@ bool LoadGlFunctions() {
     return complete;
 }
 
-// 请求的多重采样数（MSAA），驱动不支持时自动回退
-constexpr int kRequestedSamples = 4;
-
 } // namespace
 
 GlContext::~GlContext() {
     Destroy();
 }
 
-bool GlContext::Create(HWND hwnd, bool vsync, bool doubleBuffer, bool antialias) {
+bool GlContext::Create(HWND hwnd, bool vsync, bool doubleBuffer, int antialiasLevel) {
     if (hwnd == nullptr || context_ != nullptr) {
         return false;
     }
@@ -230,13 +227,13 @@ bool GlContext::Create(HWND hwnd, bool vsync, bool doubleBuffer, bool antialias)
         return false;
     }
 
-    int samples = antialias ? kRequestedSamples : 0;
+    // 按请求等级启用多重采样；驱动不支持时逐级回退（8 → 4 → 2 → 关闭）
+    int samples = antialiasLevel > 0 ? antialiasLevel : 0;
     int pixelFormat = 0;
-    if (samples > 0 &&
-        !ChoosePixelFormatArb(extensions.choosePixelFormat, dc_, doubleBuffer, samples,
-                              &pixelFormat)) {
-        VB_WARN("驱动不支持 %dx 多重采样，回退到无抗锯齿", samples);
-        samples = 0;
+    while (samples > 0 && !ChoosePixelFormatArb(extensions.choosePixelFormat, dc_, doubleBuffer,
+                                                samples, &pixelFormat)) {
+        VB_WARN("驱动不支持 %dx 多重采样，尝试更低等级", samples);
+        samples = samples > 4 ? 4 : (samples > 2 ? 2 : 0);
     }
     if (samples == 0 &&
         !ChoosePixelFormatArb(extensions.choosePixelFormat, dc_, doubleBuffer, 0, &pixelFormat)) {

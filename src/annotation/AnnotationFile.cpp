@@ -28,11 +28,12 @@ bool SaveToFile(const std::wstring& path, const StrokeLayer& layer) {
         RemoveFile(path);
         return true;
     }
-    if (!img::SavePng(path, layer.pixels(), layer.width(), layer.height(), layer.stride())) {
+    if (!img::SavePng(path, layer.bufferPixels(), layer.bufferWidth(), layer.bufferHeight(),
+                      layer.bufferStride())) {
         VB_WARN("保存笔迹文件失败: %ls", path.c_str());
         return false;
     }
-    VB_INFO("笔迹已保存: %ls (%dx%d)", path.c_str(), layer.width(), layer.height());
+    VB_INFO("笔迹已保存: %ls (%dx%d)", path.c_str(), layer.bufferWidth(), layer.bufferHeight());
     return true;
 }
 
@@ -46,12 +47,22 @@ bool LoadFromFile(const std::wstring& path, StrokeLayer& layer, int expectedWidt
         VB_WARN("笔迹文件解码失败: %ls", path.c_str());
         return false;
     }
-    if (image.width() != expectedWidth || image.height() != expectedHeight) {
-        VB_WARN("笔迹尺寸与画面不符，已忽略: %ls（%dx%d ≠ %dx%d）", path.c_str(), image.width(),
-                image.height(), expectedWidth, expectedHeight);
+    layer.Reset(expectedWidth, expectedHeight);
+    if (!layer.valid()) {
         return false;
     }
-    if (!layer.ImportPixels(image.pixels(), image.width(), image.height(), image.stride())) {
+    // 文件按内部超采样尺寸保存；旧版本按逻辑尺寸保存的笔迹放大到缓冲
+    if (layer.bufferWidth() == image.width() && layer.bufferHeight() == image.height()) {
+        if (!layer.ImportBuffer(image.pixels(), image.stride())) {
+            return false;
+        }
+    } else if (image.width() == expectedWidth && image.height() == expectedHeight) {
+        if (!layer.ImportPixels(image.pixels(), image.width(), image.height(), image.stride())) {
+            return false;
+        }
+    } else {
+        VB_WARN("笔迹尺寸与画面不符，已忽略: %ls（%dx%d ≠ %dx%d）", path.c_str(), image.width(),
+                image.height(), expectedWidth, expectedHeight);
         return false;
     }
     VB_INFO("笔迹已载入: %ls (%dx%d)", path.c_str(), image.width(), image.height());
@@ -78,12 +89,21 @@ bool CompositeFileInto(const std::wstring& path, uint8_t* target, int width, int
     if (!image.LoadFromFile(path)) {
         return false;
     }
-    if (image.width() != width || image.height() != height) {
-        VB_WARN("笔迹尺寸与照片不符，跳过合成: %ls", path.c_str());
+    StrokeLayer layer;
+    layer.Reset(width, height);
+    if (!layer.valid()) {
         return false;
     }
-    StrokeLayer layer;
-    if (!layer.ImportPixels(image.pixels(), image.width(), image.height(), image.stride())) {
+    if (layer.bufferWidth() == image.width() && layer.bufferHeight() == image.height()) {
+        if (!layer.ImportBuffer(image.pixels(), image.stride())) {
+            return false;
+        }
+    } else if (image.width() == width && image.height() == height) {
+        if (!layer.ImportPixels(image.pixels(), image.width(), image.height(), image.stride())) {
+            return false;
+        }
+    } else {
+        VB_WARN("笔迹尺寸与照片不符，跳过合成: %ls", path.c_str());
         return false;
     }
     layer.Composite(target, stride);

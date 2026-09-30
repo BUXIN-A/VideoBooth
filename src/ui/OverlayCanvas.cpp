@@ -5,10 +5,17 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <vector>
 
 namespace vb {
 namespace ui {
 namespace {
+
+// 全局 GUI 字体族，留空表示使用内置默认字体
+std::wstring& GlobalFontFamily() {
+    static std::wstring family;
+    return family;
+}
 
 HBITMAP CreateTopDownDib(HDC dc, int width, int height, void** bits, int* stride) {
     BITMAPINFO info = {};
@@ -210,24 +217,55 @@ void OverlayCanvas::FillRoundRect(const RECT& rect, int radius, COLORREF color, 
     }
     const int maxRadius = std::min((right - left + 1) / 2, (bottom - top + 1) / 2);
     radius = std::max(0, std::min(radius, maxRadius));
-
-    for (int y = top; y <= bottom; ++y) {
-        int inset = 0;
-        if (radius > 0) {
-            int dy = 0;
-            if (y < top + radius) {
-                dy = top + radius - y;
-            } else if (y > bottom - radius) {
-                dy = y - (bottom - radius);
-            }
-            if (dy > 0) {
-                const float offset =
-                    static_cast<float>(radius) * radius -
-                    static_cast<float>(dy) * static_cast<float>(dy);
-                inset = radius - static_cast<int>(std::sqrt(std::max(0.0f, offset)));
-            }
+    if (radius == 0) {
+        for (int y = top; y <= bottom; ++y) {
+            FillSpan(left, right, y, color, alpha);
         }
-        FillSpan(left + inset, right - inset, y, color, alpha);
+        return;
+    }
+
+    const float r = ChannelFloat(GetRValue(color));
+    const float g = ChannelFloat(GetGValue(color));
+    const float b = ChannelFloat(GetBValue(color));
+    const float baseAlpha = ChannelFloat(alpha);
+
+    // 圆角按有符号距离计算逐像素覆盖度，得到平滑边缘（抗锯齿）
+    const float centerX = static_cast<float>(left + right + 1) * 0.5f;
+    const float centerY = static_cast<float>(top + bottom + 1) * 0.5f;
+    const float cornerX = static_cast<float>(right - left + 1) * 0.5f - static_cast<float>(radius);
+    const float cornerY = static_cast<float>(bottom - top + 1) * 0.5f - static_cast<float>(radius);
+
+    const int y0 = std::max(top, 0);
+    const int y1 = std::min(bottom, height_ - 1);
+    for (int y = y0; y <= y1; ++y) {
+        if (clipEnabled_ && (y < clip_.top || y >= clip_.bottom)) {
+            continue;
+        }
+        const float dy =
+            std::max(std::fabs(static_cast<float>(y) + 0.5f - centerY) - cornerY, 0.0f);
+        int x0 = std::max(left, 0);
+        int x1 = std::min(right, width_ - 1);
+        if (clipEnabled_) {
+            x0 = std::max(x0, static_cast<int>(clip_.left));
+            x1 = std::min(x1, static_cast<int>(clip_.right) - 1);
+        }
+        if (x1 < x0) {
+            continue;
+        }
+        uint8_t* row = bits_ + static_cast<ptrdiff_t>(y) * stride_;
+        for (int x = x0; x <= x1; ++x) {
+            const float dx =
+                std::max(std::fabs(static_cast<float>(x) + 0.5f - centerX) - cornerX, 0.0f);
+            const float distance = (dx > 0.0f && dy > 0.0f)
+                                       ? std::sqrt(dx * dx + dy * dy) - static_cast<float>(radius)
+                                       : std::max(dx, dy) - static_cast<float>(radius);
+            const float coverage = std::min(1.0f, std::max(0.0f, 0.5f - distance));
+            if (coverage <= 0.0f) {
+                continue;
+            }
+            BlendPremultiplied(row + static_cast<ptrdiff_t>(x) * 4, r, g, b,
+                               baseAlpha * coverage);
+        }
     }
 }
 
@@ -315,33 +353,68 @@ void OverlayCanvas::DrawPixels(const uint8_t* bgra, int sourceWidth, int sourceH
             x1 = std::min(std::max(x1, x0 + 1), sourceWidth);
             y1 = std::min(std::max(y1, y0 + 1), sourceHeight);
 
-            // 3x3 均值采样：兼顾缩放质量与性能
-            const int stepX = std::max(1, (x1 - x0) / 3);
-            const int stepY = std::max(1, (y1 - y0) / 3);
-            float sumB = 0.0f;
-            float sumG = 0.0f;
-            float sumR = 0.0f;
-            float sumA = 0.0f;
-            int samples = 0;
-            for (int sy = y0; sy < y1; sy += stepY) {
-                const uint8_t* row = bgra + static_cast<ptrdiff_t>(sy) * sourceStride;
-                for (int sx = x0; sx < x1; sx += stepX) {
-                    const uint8_t* pixel = row + static_cast<ptrdiff_t>(sx) * 4;
-                    sumB += pixel[0];
-                    sumG += pixel[1];
-                    sumR += pixel[2];
-                    sumA += pixel[3];
-                    ++samples;
+            float sampleB = 0.0f;
+            float sampleG = 0.0f;
+            float sampleR = 0.0f;
+            float sampleA = 0.0f;
+            if (sx1 - sx0 <= 1.0f && sy1 - sy0 <= 1.0f) {
+                // 放大：双线性插值，避免图标在 GUI 缩放后出现块状锯齿
+                const float fx = (sx0 + sx1) * 0.5f - 0.5f;
+                const float fy = (sy0 + sy1) * 0.5f - 0.5f;
+                const int ix = std::max(0, std::min(static_cast<int>(std::floor(fx)),
+                                                   sourceWidth - 1));
+                const int iy = std::max(0, std::min(static_cast<int>(std::floor(fy)),
+                                                   sourceHeight - 1));
+                const int jx = std::min(ix + 1, sourceWidth - 1);
+                const int jy = std::min(iy + 1, sourceHeight - 1);
+                const float tx = std::max(0.0f, std::min(fx - static_cast<float>(ix), 1.0f));
+                const float ty = std::max(0.0f, std::min(fy - static_cast<float>(iy), 1.0f));
+                const uint8_t* rowA = bgra + static_cast<ptrdiff_t>(iy) * sourceStride;
+                const uint8_t* rowB = bgra + static_cast<ptrdiff_t>(jy) * sourceStride;
+                const uint8_t* p00 = rowA + static_cast<ptrdiff_t>(ix) * 4;
+                const uint8_t* p10 = rowA + static_cast<ptrdiff_t>(jx) * 4;
+                const uint8_t* p01 = rowB + static_cast<ptrdiff_t>(ix) * 4;
+                const uint8_t* p11 = rowB + static_cast<ptrdiff_t>(jx) * 4;
+                const float w00 = (1.0f - tx) * (1.0f - ty);
+                const float w10 = tx * (1.0f - ty);
+                const float w01 = (1.0f - tx) * ty;
+                const float w11 = tx * ty;
+                sampleB = p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11;
+                sampleG = p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11;
+                sampleR = p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11;
+                sampleA = p00[3] * w00 + p10[3] * w10 + p01[3] * w01 + p11[3] * w11;
+            } else {
+                // 缩小：区域均值采样，兼顾缩放质量与性能
+                const int stepX = std::max(1, (x1 - x0) / 3);
+                const int stepY = std::max(1, (y1 - y0) / 3);
+                float sumB = 0.0f;
+                float sumG = 0.0f;
+                float sumR = 0.0f;
+                float sumA = 0.0f;
+                int samples = 0;
+                for (int sy = y0; sy < y1; sy += stepY) {
+                    const uint8_t* row = bgra + static_cast<ptrdiff_t>(sy) * sourceStride;
+                    for (int sx = x0; sx < x1; sx += stepX) {
+                        const uint8_t* pixel = row + static_cast<ptrdiff_t>(sx) * 4;
+                        sumB += pixel[0];
+                        sumG += pixel[1];
+                        sumR += pixel[2];
+                        sumA += pixel[3];
+                        ++samples;
+                    }
                 }
+                if (samples == 0) {
+                    continue;
+                }
+                const float inverse = 1.0f / static_cast<float>(samples);
+                sampleB = sumB * inverse;
+                sampleG = sumG * inverse;
+                sampleR = sumR * inverse;
+                sampleA = sumA * inverse;
             }
-            if (samples == 0) {
-                continue;
-            }
-            const float inverse = 1.0f / static_cast<float>(samples);
-            // 预乘数据按通道平均后可直接混合
-            BlendPremultipliedFloats(canvasRow + static_cast<ptrdiff_t>(canvasX) * 4,
-                                     sumB * inverse, sumG * inverse, sumR * inverse,
-                                     sumA * inverse, globalAlpha);
+            // 预乘数据按通道均值/插值后可直接混合
+            BlendPremultipliedFloats(canvasRow + static_cast<ptrdiff_t>(canvasX) * 4, sampleB,
+                                     sampleG, sampleR, sampleA, globalAlpha);
         }
     }
 }
@@ -414,16 +487,33 @@ bool OverlayCanvas::EnsureMask(int width, int height) {
     return true;
 }
 
+void OverlayCanvas::SetFontFamily(const std::wstring& family) {
+    GlobalFontFamily() = family;
+}
+
+const std::wstring& OverlayCanvas::FontFamily() {
+    return GlobalFontFamily();
+}
+
 HFONT OverlayCanvas::FontFor(int fontPixels) {
     fontPixels = std::max(6, fontPixels);
+    const std::wstring& family = GlobalFontFamily();
+    if (fontsFamily_ != family) {
+        // 字体族变化：丢弃旧句柄，避免缓存继续使用旧字体
+        for (const auto& entry : fonts_) {
+            ::DeleteObject(entry.second);
+        }
+        fonts_.clear();
+        fontsFamily_ = family;
+    }
     const auto existing = fonts_.find(fontPixels);
     if (existing != fonts_.end()) {
         return existing->second;
     }
+    const wchar_t* face = family.empty() ? L"Microsoft YaHei UI" : family.c_str();
     HFONT font = ::CreateFontW(-fontPixels, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
                               DEFAULT_CHARSET, OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS,
-                              ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
-                              L"Microsoft YaHei UI");
+                              ANTIALIASED_QUALITY, DEFAULT_PITCH | FF_DONTCARE, face);
     if (font == nullptr) {
         font = static_cast<HFONT>(::GetStockObject(DEFAULT_GUI_FONT));
     }
@@ -506,6 +596,59 @@ void OverlayCanvas::DrawText(const std::wstring& text, const RECT& box, int font
             }
             BlendPremultiplied(canvasRow + static_cast<ptrdiff_t>(canvasX) * 4, r, g, b,
                                baseAlpha * ChannelFloat(coverage));
+        }
+    }
+}
+
+void OverlayCanvas::ApplyImageEffect(const RECT& rect, float sharpen, float brightness) {
+    if (!valid() || (sharpen <= 0.0f && brightness == 1.0f)) {
+        return;
+    }
+    const int left = std::max(0, static_cast<int>(rect.left));
+    const int top = std::max(0, static_cast<int>(rect.top));
+    const int right = std::min(width_, static_cast<int>(rect.right));
+    const int bottom = std::min(height_, static_cast<int>(rect.bottom));
+    const int width = right - left;
+    const int height = bottom - top;
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    // 先拷贝源区域，避免边计算边修改导致锐化结果沿扫描方向扩散
+    const size_t rowBytes = static_cast<size_t>(width) * 4u;
+    std::vector<uint8_t> source(rowBytes * static_cast<size_t>(height));
+    for (int y = 0; y < height; ++y) {
+        std::memcpy(source.data() + rowBytes * static_cast<size_t>(y),
+                    bits_ + static_cast<ptrdiff_t>(top + y) * stride_ +
+                        static_cast<ptrdiff_t>(left) * 4,
+                    rowBytes);
+    }
+
+    const auto sample = [&source, width](int x, int y, int channel) {
+        return static_cast<float>(
+            source[(static_cast<size_t>(y) * width + x) * 4u + static_cast<size_t>(channel)]);
+    };
+
+    for (int y = 0; y < height; ++y) {
+        uint8_t* row = bits_ + static_cast<ptrdiff_t>(top + y) * stride_ +
+                       static_cast<ptrdiff_t>(left) * 4;
+        for (int x = 0; x < width; ++x) {
+            const int xm = x > 0 ? x - 1 : x;
+            const int xp = x + 1 < width ? x + 1 : x;
+            const int ym = y > 0 ? y - 1 : y;
+            const int yp = y + 1 < height ? y + 1 : y;
+            uint8_t* pixel = row + static_cast<ptrdiff_t>(x) * 4;
+            for (int channel = 0; channel < 3; ++channel) {
+                float value = sample(x, y, channel);
+                if (sharpen > 0.0f) {
+                    const float neighbors = sample(xm, y, channel) + sample(xp, y, channel) +
+                                            sample(x, ym, channel) + sample(x, yp, channel);
+                    value += (value - neighbors * 0.25f) * sharpen;
+                }
+                value *= brightness;
+                value = std::min(value, static_cast<float>(pixel[3]));
+                pixel[channel] = static_cast<uint8_t>(std::max(0.0f, value) + 0.5f);
+            }
         }
     }
 }

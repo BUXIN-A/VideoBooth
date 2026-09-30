@@ -117,8 +117,8 @@ class GlContext {
 public:
     ~GlContext();
 
-    // antialias 为真时请求 4x 多重采样（MSAA），驱动不支持时自动回退到无抗锯齿
-    bool Create(HWND hwnd, bool vsync, bool doubleBuffer, bool antialias);
+    // antialiasLevel 为多重采样数（0 / 2 / 4 / 8），驱动不支持时逐级回退
+    bool Create(HWND hwnd, bool vsync, bool doubleBuffer, int antialiasLevel);
     void Destroy();
 
     void MakeCurrent();

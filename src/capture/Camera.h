@@ -61,6 +61,10 @@ public:
     const std::wstring& deviceId() const { return deviceId_; }
     const std::wstring& deviceName() const { return deviceName_; }
 
+    // 设备端亮度（0-100 百分比映射到设备亮度区间）；不支持时返回 false
+    bool BrightnessSupported() const { return brightnessSupported_.load(); }
+    bool SetBrightness(int percent);
+
     // 采集线程是否因设备驱动无响应而被分离（此时不应再释放 MF 环境）
     bool IsThreadLeaked() const { return threadBlocked_; }
 
@@ -69,14 +73,17 @@ private:
 
     struct OpenRequest {
         std::wstring deviceId;
-        int width = 1280;
-        int height = 720;
+        // 0/0 表示使用设备原生最大分辨率
+        int width = 0;
+        int height = 0;
         int fps = 30;
         bool autoExposure = false;
     };
 
     void ThreadMain();
     bool OpenOnCaptureThread(const OpenRequest& request);
+    // 探测设备端亮度控制的范围（不支持时置 brightnessSupported_ 为 false）
+    void QueryBrightnessRange(IMFMediaSource* source);
     void CaptureLoop();
     void Publish(const uint8_t* scan0, ptrdiff_t pitch, int width, int height);
 
@@ -107,6 +114,11 @@ private:
     std::wstring deviceId_;
     std::wstring deviceName_;
     std::atomic<int> fps_{30};
+
+    // 设备端亮度支持情况（打开设备时探测）
+    std::atomic<bool> brightnessSupported_{false};
+    long brightnessMin_ = 0;
+    long brightnessMax_ = 100;
 };
 
 } // namespace capture

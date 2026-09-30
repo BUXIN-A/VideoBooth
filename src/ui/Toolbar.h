@@ -14,10 +14,9 @@ enum class ToolButtonId : int {
     Select = 0,
     Annotate,
     Erase,
-    Rotate,
-    Lock,
     Shoot,
     Album,
+    Adjust, // 画面调节（旋转 / 锁定 / 亮度）
     Settings,
     Minimize,
     Exit,

@@ -22,6 +22,9 @@ struct PreviewView {
     float offsetX = 0.0f;
     float offsetY = 0.0f;
     bool interactive = true;
+    // 显示端增强（与主画面保持一致）
+    float sharpen = 0.0f;
+    float brightness = 1.0f;
     // 批注层（可为空），与画面同尺寸、同变换
     const uint8_t* overlayPixels = nullptr;
     int overlayWidth = 0;
@@ -31,12 +34,12 @@ struct PreviewView {
 };
 
 // 左下角预览框：显示画面全景，蓝色虚线框表示当前屏幕可见区域，可拖动。
-// 预览框本身也可按住拖动改变位置（仅本次运行有效），位置限制在避开功能栏的可用区域内。
+// 预览框本身也可按住拖动改变位置（仅本次运行有效），边界为窗口边缘，允许与功能栏重叠。
 class PreviewPanel {
 public:
     void SetScale(float uiScale);
-    // 依据窗口尺寸与功能栏矩形重算预览框位置（避免与功能栏相互遮挡）
-    void Layout(int windowWidth, int windowHeight, const RECT& toolbarBounds);
+    // 依据窗口尺寸重算预览框位置（边界为窗口边缘，不与功能栏相互避让）
+    void Layout(int windowWidth, int windowHeight);
     const RECT& bounds() const { return bounds_; }
 
     void SetView(const PreviewView& view);
@@ -72,8 +75,7 @@ private:
     // 最近一次布局输入，拖动位置时据此重算
     int windowWidth_ = 0;
     int windowHeight_ = 0;
-    RECT toolbarBounds_ = {};
-    // 相对默认位置（可用区域左下角）的偏移
+    // 相对默认位置（左下角，留边距）的偏移
     int positionOffsetX_ = 0;
     int positionOffsetY_ = 0;
 

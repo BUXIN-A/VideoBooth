@@ -48,6 +48,11 @@ const wchar_t* const kButtonIcons[kButtonCount] = {L"delete.png", L"save.png", L
 const wchar_t* const kComposeLabel = L"合成笔迹";
 const wchar_t* const kComposeIconOff = L"checkbox.png";
 const wchar_t* const kComposeIconOn = L"checkbox_ok.png";
+const wchar_t* const kCompareIcon = L"comparative_teaching.png";
+// 对比教学模式下同一按钮改为「退出对比教学」
+const wchar_t* const kExitCompareIcon = L"exit_comparative_teaching.png";
+const wchar_t* const kConfirmIcon = L"ok.png";
+const wchar_t* const kCancelIcon = L"cancel.png";
 
 constexpr COLORREF kPanelColor = RGB(238, 238, 238);
 constexpr COLORREF kCardColor = RGB(255, 255, 255);
@@ -87,6 +92,12 @@ void AlbumPanel::SetOpen(bool open) {
         dragging_ = false;
         dragged_ = false;
         hover_ = AlbumPanelHit();
+        // 对比教学依赖面板状态（关闭面板不退出教学），需保留模式与已选照片；
+        // 常规 / 保存多选模式收起时复位
+        if (mode_ != Mode::Compare) {
+            mode_ = Mode::Normal;
+            selection_.clear();
+        }
     }
 }
 
@@ -95,7 +106,46 @@ void AlbumPanel::SetPhotoCount(size_t count) {
     if (shownIndex_ >= static_cast<long long>(count)) {
         shownIndex_ = -1;
     }
+    // 照片被删除后同步清理已选下标
+    for (size_t i = selection_.size(); i > 0; --i) {
+        if (selection_[i - 1] >= count) {
+            selection_.erase(selection_.begin() + static_cast<ptrdiff_t>(i - 1));
+        }
+    }
     scrollX_ = std::max(0, std::min(scrollX_, MaxScroll()));
+}
+
+void AlbumPanel::SetMode(Mode mode) {
+    if (mode_ == mode) {
+        return;
+    }
+    mode_ = mode;
+    selection_.clear();
+    hover_ = AlbumPanelHit();
+    // 标题行按钮随模式变化（确定/取消、退出对比教学等），需立即重算矩形
+    UpdateHeaderButtons();
+}
+
+void AlbumPanel::ClearSelection() {
+    selection_.clear();
+}
+
+bool AlbumPanel::IsSelected(size_t index) const {
+    return std::find(selection_.begin(), selection_.end(), index) != selection_.end();
+}
+
+bool AlbumPanel::ToggleSelection(size_t index) {
+    const auto found = std::find(selection_.begin(), selection_.end(), index);
+    if (found != selection_.end()) {
+        selection_.erase(found);
+        return true;
+    }
+    // 对比教学模式限制同时展示的数量；保存多选不限制
+    if (mode_ == Mode::Compare && selection_.size() >= kMaxSelection) {
+        return false;
+    }
+    selection_.push_back(index);
+    return true;
 }
 
 void AlbumPanel::SetHover(const AlbumPanelHit& hit) {
@@ -126,18 +176,45 @@ void AlbumPanel::UpdateHeaderButtons() {
     const int titleTop = static_cast<int>(kPadding * s);
     const int titleHeight = static_cast<int>(kTitleHeight * s);
     const int top = titleTop + (titleHeight - height) / 2;
-    headerSaveAllRect_ = {viewport.right - width, top, viewport.right, top + height};
-    headerImportRect_ = {headerSaveAllRect_.left - gap - width, top,
-                         headerSaveAllRect_.left - gap, top + height};
 
-    // “合成笔迹”选择框位于导入按钮左侧（图标 + 文字整体可点击）
-    const int textWidth =
-        canvas_.MeasureText(kComposeLabel, static_cast<int>(kHeaderLabelFont * s)).cx;
-    const int composeWidth = height + static_cast<int>(kHeaderLabelGap * s) + textWidth;
-    headerComposeRect_ = {headerImportRect_.left - gap - composeWidth, top,
-                          headerImportRect_.left - gap, top + height};
-    headerComposeBoxRect_ = {headerComposeRect_.left, top, headerComposeRect_.left + height,
-                             top + height};
+    // 先清空：当前模式下未显示的按钮不参与命中
+    headerImportRect_ = {0, 0, 0, 0};
+    headerSaveAllRect_ = {0, 0, 0, 0};
+    headerCompareRect_ = {0, 0, 0, 0};
+    headerConfirmRect_ = {0, 0, 0, 0};
+    headerCancelRect_ = {0, 0, 0, 0};
+    headerComposeRect_ = {0, 0, 0, 0};
+    headerComposeBoxRect_ = {0, 0, 0, 0};
+
+    int right = viewport.right;
+    const auto placeRight = [&](RECT& rect) {
+        rect = {right - width, top, right, top + height};
+        right = rect.left - gap;
+    };
+    switch (mode_) {
+    case Mode::SaveSelect:
+        placeRight(headerConfirmRect_);
+        placeRight(headerCancelRect_);
+        break;
+    case Mode::Compare:
+        placeRight(headerCompareRect_);
+        break;
+    default:
+        placeRight(headerSaveAllRect_);
+        placeRight(headerImportRect_);
+        placeRight(headerCompareRect_);
+        break;
+    }
+
+    // “合成笔迹”选择框位于左侧（对比教学模式不需要导出，隐藏）
+    if (mode_ != Mode::Compare) {
+        const int textWidth =
+            canvas_.MeasureText(kComposeLabel, static_cast<int>(kHeaderLabelFont * s)).cx;
+        const int composeWidth = height + static_cast<int>(kHeaderLabelGap * s) + textWidth;
+        headerComposeRect_ = {right - composeWidth, top, right, top + height};
+        headerComposeBoxRect_ = {headerComposeRect_.left, top, headerComposeRect_.left + height,
+                                 top + height};
+    }
 }
 
 int AlbumPanel::ContentWidth() const {
@@ -242,15 +319,40 @@ AlbumPanelHit AlbumPanel::HitTest(POINT point) const {
     const int localX = point.x - panelRect_.left;
     const int localY = point.y - panelRect_.top;
     // 标题行按钮：无照片时同样可用（导入照片）
-    if (InsideRect(localX, localY, headerSaveAllRect_)) {
-        hit.kind = AlbumPanelHit::Kind::SaveAll;
-        return hit;
+    switch (mode_) {
+    case Mode::SaveSelect:
+        if (InsideRect(localX, localY, headerConfirmRect_)) {
+            hit.kind = AlbumPanelHit::Kind::ConfirmSelect;
+            return hit;
+        }
+        if (InsideRect(localX, localY, headerCancelRect_)) {
+            hit.kind = AlbumPanelHit::Kind::CancelSelect;
+            return hit;
+        }
+        break;
+    case Mode::Compare:
+        if (InsideRect(localX, localY, headerCompareRect_)) {
+            hit.kind = AlbumPanelHit::Kind::Compare;
+            return hit;
+        }
+        break;
+    default:
+        if (InsideRect(localX, localY, headerSaveAllRect_)) {
+            hit.kind = AlbumPanelHit::Kind::SaveAll;
+            return hit;
+        }
+        if (InsideRect(localX, localY, headerImportRect_)) {
+            hit.kind = AlbumPanelHit::Kind::Import;
+            return hit;
+        }
+        if (InsideRect(localX, localY, headerCompareRect_)) {
+            hit.kind = AlbumPanelHit::Kind::Compare;
+            return hit;
+        }
+        break;
     }
-    if (InsideRect(localX, localY, headerImportRect_)) {
-        hit.kind = AlbumPanelHit::Kind::Import;
-        return hit;
-    }
-    if (InsideRect(localX, localY, headerComposeRect_)) {
+    // “合成笔迹”选择框仅在常规模式下可见与可点击（多选/对比教学模式不提供）
+    if (mode_ == Mode::Normal && InsideRect(localX, localY, headerComposeRect_)) {
         hit.kind = AlbumPanelHit::Kind::ComposeAnnotation;
         return hit;
     }
@@ -270,6 +372,12 @@ AlbumPanelHit AlbumPanel::HitTest(POINT point) const {
         }
         if (!InsideRect(localX, localY, geometry.card)) {
             continue;
+        }
+        // 多选模式：整张卡片都是勾选开关
+        if (selecting()) {
+            hit.kind = AlbumPanelHit::Kind::SelectToggle;
+            hit.index = i;
+            return hit;
         }
         for (int b = 0; b < kButtonCount; ++b) {
             if (InsideRect(localX, localY, geometry.buttons[b])) {
@@ -320,9 +428,12 @@ void AlbumPanel::RenderCard(const CardGeometry& geometry, size_t index,
                             const img::Image* const* buttonIcons) {
     const float s = scale_;
     const bool shown = static_cast<long long>(index) == shownIndex_;
+    const bool selected = selecting() && IsSelected(index);
     const bool thumbHover = hover_.kind == AlbumPanelHit::Kind::Thumbnail && hover_.index == index;
+    const bool selectHover =
+        hover_.kind == AlbumPanelHit::Kind::SelectToggle && hover_.index == index;
 
-    if (shown) {
+    if (shown || selected) {
         RECT ring = geometry.card;
         ::InflateRect(&ring, static_cast<int>(3.0f * s), static_cast<int>(3.0f * s));
         canvas_.FillRoundRect(ring, static_cast<int>(12.0f * s), kAccentColor, 255);
@@ -347,7 +458,15 @@ void AlbumPanel::RenderCard(const CardGeometry& geometry, size_t index,
     } else {
         canvas_.DrawText(L"…", geometry.thumb, static_cast<int>(20.0f * s), kSubTitleColor, 200);
     }
-    if (thumbHover && !shown) {
+
+    if (selecting()) {
+        if (selected) {
+            canvas_.FillRect(geometry.thumb, kAccentColor, 40);
+        }
+        RenderCardCheckBox(geometry.thumb, index);
+        return; // 多选模式下不提供删除/保存/展示按钮
+    }
+    if ((thumbHover || selectHover) && !shown) {
         canvas_.DrawDashedRect(geometry.thumb, kAccentColor, 220, std::max(1, static_cast<int>(2.0f * s)),
                                static_cast<int>(10.0f * s), static_cast<int>(6.0f * s));
     }
@@ -395,6 +514,22 @@ void AlbumPanel::RenderHeaderButton(const RECT& rect, const wchar_t* icon, const
     canvas_.FillRoundRect(rect, static_cast<int>(7.0f * scale_), hovered ? kButtonHover : kButtonColor,
                           255);
     canvas_.DrawText(fallback, rect, static_cast<int>(12.0f * scale_), kTitleColor, 255);
+}
+
+void AlbumPanel::RenderCardCheckBox(const RECT& thumb, size_t index) {
+    const float s = scale_;
+    const int box = static_cast<int>(26.0f * s);
+    const int inset = static_cast<int>(6.0f * s);
+    const RECT rect = {thumb.left + inset, thumb.top + inset, thumb.left + inset + box,
+                       thumb.top + inset + box};
+    const bool on = IsSelected(index);
+    const img::Image* icon =
+        resources_ != nullptr ? resources_->Get(on ? kComposeIconOn : kComposeIconOff) : nullptr;
+    if (icon != nullptr && icon->Valid()) {
+        canvas_.DrawPixels(icon->pixels(), icon->width(), icon->height(), icon->stride(), rect);
+        return;
+    }
+    canvas_.FillRoundRect(rect, static_cast<int>(5.0f * s), on ? kAccentColor : kCardColor, 235);
 }
 
 void AlbumPanel::RenderHeaderCheckBox(bool hovered) {
@@ -471,21 +606,36 @@ void AlbumPanel::Render(const ThumbnailProvider& provider) {
     canvas_.DrawText(L"相册", titleRect, static_cast<int>(15.0f * s), kTitleColor, 255,
                      DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
-    // 标题行右侧：合成笔迹选择框、导入照片、保存照片
-    RenderHeaderCheckBox(hover_.kind == AlbumPanelHit::Kind::ComposeAnnotation);
-    RenderHeaderButton(headerImportRect_, L"import_picture.png", L"导入",
-                       hover_.kind == AlbumPanelHit::Kind::Import);
-    RenderHeaderButton(headerSaveAllRect_, L"save_picture.png", L"保存",
-                       hover_.kind == AlbumPanelHit::Kind::SaveAll);
+    // 标题行右侧按钮随模式变化
+    if (mode_ == Mode::SaveSelect) {
+        RenderHeaderButton(headerCancelRect_, kCancelIcon, L"取消",
+                           hover_.kind == AlbumPanelHit::Kind::CancelSelect);
+        RenderHeaderButton(headerConfirmRect_, kConfirmIcon, L"确定",
+                           hover_.kind == AlbumPanelHit::Kind::ConfirmSelect);
+    } else if (mode_ == Mode::Compare) {
+        RenderHeaderButton(headerCompareRect_, kExitCompareIcon, L"退出教学",
+                           hover_.kind == AlbumPanelHit::Kind::Compare);
+    } else {
+        RenderHeaderCheckBox(hover_.kind == AlbumPanelHit::Kind::ComposeAnnotation);
+        RenderHeaderButton(headerCompareRect_, kCompareIcon, L"对比教学",
+                           hover_.kind == AlbumPanelHit::Kind::Compare);
+        RenderHeaderButton(headerImportRect_, L"import_picture.png", L"导入",
+                           hover_.kind == AlbumPanelHit::Kind::Import);
+        RenderHeaderButton(headerSaveAllRect_, L"save_picture.png", L"保存",
+                           hover_.kind == AlbumPanelHit::Kind::SaveAll);
+    }
 
     if (photoCount_ > 0) {
+        const int textRight = mode_ == Mode::Compare ? headerCompareRect_.left
+                                                     : headerComposeRect_.left;
         const RECT countRect = {viewport.left, titleRect.top,
-                                headerComposeRect_.left - static_cast<int>(kHeaderButtonInset * s),
+                                textRight - static_cast<int>(kHeaderButtonInset * s),
                                 titleRect.bottom};
-        canvas_.DrawText(
-            FormatW(L"共 %llu 张", static_cast<unsigned long long>(photoCount_)), countRect,
-            static_cast<int>(13.0f * s), kSubTitleColor, 255,
-            DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        const std::wstring countText =
+            selecting() ? FormatW(L"已选 %llu 张", static_cast<unsigned long long>(selection_.size()))
+                        : FormatW(L"共 %llu 张", static_cast<unsigned long long>(photoCount_));
+        canvas_.DrawText(countText, countRect, static_cast<int>(13.0f * s), kSubTitleColor, 255,
+                         DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 
     if (photoCount_ == 0) {

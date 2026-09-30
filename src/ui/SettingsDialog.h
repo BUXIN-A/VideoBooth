@@ -24,6 +24,7 @@ public:
     // 需要重绘时返回 true，由调用方上传纹理
     bool dirty() const { return dirty_; }
     void ClearDirty() { dirty_ = false; }
+    void MarkDirty() { dirty_ = true; }
 
     // 打开面板：config 为当前配置副本，点击“保存”后结果写入 result()
     void Open(HWND owner, const core::AppConfig& config,
@@ -72,14 +73,17 @@ private:
         TabAbout,
         ToolbarPosition,
         GuiScale,
+        FontFamily,
         FolderBrowse,
         SaveLog,
         Camera,
         Fps,
         Resolution,
         AutoExposure,
+        Rotation,
         Vsync,
-        Antialias,
+        AntialiasLevel,
+        SharpenLevel,
         DoubleBuffer,
         CheckUpdate,
         UpdateDownload,
@@ -124,6 +128,8 @@ private:
     void DrawPageCard(const RECT& rect);
     void DrawLabel(const RECT& bounds, const std::wstring& text);
     void DrawDropdown(const RECT& rect, const std::wstring& text, bool expanded, bool hovered);
+    // 绘制指定下拉字段（显示当前选中项与交互状态）
+    void DrawChoiceDropdown(Field field);
     void DrawSwitch(const RECT& rect, bool on, bool hovered);
     void DrawButton(const RECT& rect, const std::wstring& text, bool primary, bool hovered);
     void DrawPathField(const RECT& rect, const std::wstring& text, bool hovered);
@@ -159,9 +165,9 @@ private:
     std::vector<int> resolutionWidths_;
     std::vector<int> resolutionHeights_;
     std::vector<double> guiScaleValues_; // 首项为 -1（自适应），其余为倍率
+    std::vector<std::wstring> fontFamilyNames_; // 与字体下拉项一一对应的字体族名（空 = 默认）
     bool autoExposure_ = false;
     bool vsync_ = false;
-    bool antialias_ = false;
     bool doubleBuffer_ = false;
     bool saveLog_ = false;
 

@@ -38,6 +38,8 @@ constexpr ULONGLONG kFlashDurationMs = 150;
 // 自适应 GUI 缩放时“窗口高度 / 1080”的比例上下限，避免极端分辨率下界面过大或过小
 constexpr float kMinAutoScaleRatio = 0.8f;
 constexpr float kMaxAutoScaleRatio = 1.4f;
+// 锐化等级（关闭 / 低 / 中 / 高）对应的着色器强度
+constexpr float kSharpenStrengths[] = {0.0f, 0.35f, 0.7f, 1.1f};
 
 const gfx::Color kBackdrop(0.07f, 0.07f, 0.07f, 1.0f);
 
@@ -205,13 +207,20 @@ bool MainWindow::Create(HINSTANCE instance, const MainWindowDeps& deps) {
     preview_.SetScale(uiScale_);
     morePanel_.Init(deps_.resources);
     morePanel_.SetScale(uiScale_);
+    adjustPanel_.Init(deps_.resources);
+    adjustPanel_.SetScale(uiScale_);
     albumPanel_.Init(deps_.resources);
     albumPanel_.SetScale(uiScale_);
-    SyncAnnotationStyle();
+    SyncAnnotationStyle(annotation_);
+    // 应用配置中的 GUI 字体族与锐化等级
+    OverlayCanvas::SetFontFamily(deps_.configStore->Get().fontFamily);
+    sharpenStrength_ =
+        kSharpenStrengths[std::max(0, std::min(3, deps_.configStore->Get().render.sharpenLevel))];
+    brightnessPercent_ = 50;
 
     if (!gl_.Create(hwnd_, deps_.configStore->Get().render.vsync,
                     deps_.configStore->Get().render.doubleBuffer,
-                    deps_.configStore->Get().render.antialias)) {
+                    deps_.configStore->Get().render.antialiasLevel)) {
         ::MessageBoxW(hwnd_, L"初始化 OpenGL 渲染环境失败，程序无法继续运行。", L"VideoBooth",
                       MB_ICONERROR | MB_OK);
         return false;
@@ -223,6 +232,8 @@ bool MainWindow::Create(HINSTANCE instance, const MainWindowDeps& deps) {
     }
 
     gl_.MakeCurrent();
+    // 应用配置中的默认旋转方向
+    state_.rotationQuarter = deps_.configStore->Get().rotationQuarter;
     Relayout();
     SyncToolbarState();
     ShowToast(L"正在初始化画面…");
@@ -458,8 +469,12 @@ void MainWindow::OnRender() {
     renderer_.BeginFrame(width, height, kBackdrop);
 
     UpdatePicture();
+    UploadCompareTextures();
 
-    if (picturePixels_ != nullptr && pictureWidth_ > 0 && pictureHeight_ > 0) {
+    if (ComparisonActive()) {
+        // 对比教学模式：画面改为多张照片网格平铺
+        RenderCompareGrid(width, height);
+    } else if (picturePixels_ != nullptr && pictureWidth_ > 0 && pictureHeight_ > 0) {
         if (pictureDirty_) {
             pictureTexture_.Upload(picturePixels_, pictureWidth_, pictureHeight_, pictureStride_);
             pictureDirty_ = false;
@@ -477,17 +492,18 @@ void MainWindow::OnRender() {
                                static_cast<LONG>(centerX + drawWidth * 0.5f),
                                static_cast<LONG>(centerY + drawHeight * 0.5f)};
             const float rotation = static_cast<float>(state_.rotationQuarter) * 90.0f;
-            renderer_.DrawTexture(pictureTexture_, dest, rotation);
+            // 锐化与显示端亮度按配置与「画面调节」实时作用于显示
+            renderer_.DrawTexture(pictureTexture_, dest, rotation, gfx::Color::White(),
+                                  CurrentImageEffect());
 
             // 批注层与画面使用完全相同的变换，因此笔迹随旋转/缩放/拖动一起变化
             // （实时画面与相册照片各自持有独立笔迹层）
-            if (annotation_.valid() && annotation_.width() == pictureWidth_ &&
-                annotation_.height() == pictureHeight_) {
+            if (annotation_.valid() && annotation_.matches(pictureWidth_, pictureHeight_)) {
                 RECT dirty = {};
                 if (annotation_.TakeDirtyRect(dirty)) {
-                    annotationTexture_.UploadRegion(annotation_.pixels(), annotation_.width(),
-                                                    annotation_.height(), annotation_.stride(),
-                                                    dirty);
+                    annotationTexture_.UploadRegion(
+                        annotation_.bufferPixels(), annotation_.bufferWidth(),
+                        annotation_.bufferHeight(), annotation_.bufferStride(), dirty);
                 }
                 if (annotationTexture_.valid()) {
                     renderer_.DrawTexture(annotationTexture_, dest, rotation);
@@ -497,7 +513,8 @@ void MainWindow::OnRender() {
     }
 
     // 橡皮模式：绘制圆形擦除范围（触摸不移动系统鼠标指针，需用接触点位置）
-    if (state_.tool == core::ToolMode::Erase && state_.pictureAnnotatable()) {
+    if (state_.tool == core::ToolMode::Erase &&
+        (compareMode_ || state_.pictureAnnotatable())) {
         if (annotating_ && !touchContacts_.empty()) {
             const POINT point = touchContacts_.front().pos;
             cursorPos_ = point;
@@ -522,10 +539,12 @@ void MainWindow::OnRender() {
         }
     }
 
-    UpdatePreview();
+    if (!ComparisonActive()) {
+        UpdatePreview();
+    }
     UploadOverlayTextures();
 
-    if (previewTexture_.valid()) {
+    if (!ComparisonActive() && previewTexture_.valid()) {
         renderer_.DrawTexture(previewTexture_, preview_.bounds());
     }
     if (morePanel_.modeVisible() && morePanelTexture_.valid()) {
@@ -533,6 +552,9 @@ void MainWindow::OnRender() {
     }
     if (toolbarTexture_.valid()) {
         renderer_.DrawTexture(toolbarTexture_, toolbar_.bounds());
+    }
+    if (adjustPanel_.isOpen() && adjustPanelTexture_.valid()) {
+        renderer_.DrawTexture(adjustPanelTexture_, adjustPanel_.bounds());
     }
     if (albumPanel_.isOpen() && albumPanelTexture_.valid()) {
         renderer_.DrawTexture(albumPanelTexture_, albumPanel_.bounds());
@@ -662,8 +684,7 @@ void MainWindow::ReleaseAnnotation() {
 }
 
 void MainWindow::EnsureAnnotationFor(const std::wstring& key, int imageWidth, int imageHeight) {
-    if (key == annotationKey_ && annotation_.width() == imageWidth &&
-        annotation_.height() == imageHeight && annotation_.valid()) {
+    if (key == annotationKey_ && annotation_.matches(imageWidth, imageHeight)) {
         return; // 已是该图片的笔迹层
     }
     // 归属或尺寸变化：先把旧笔迹写回其文件，再切换到目标图片
@@ -680,27 +701,50 @@ void MainWindow::EnsureAnnotationFor(const std::wstring& key, int imageWidth, in
         return;
     }
     annotation_.Reset(imageWidth, imageHeight);
-    SyncAnnotationStyle();
+    SyncAnnotationStyle(annotation_);
     // 已有笔迹文件时恢复（尺寸不符会被忽略，保持空白层）
     annotation::LoadFromFile(AnnotationPath(key), annotation_, imageWidth, imageHeight);
     VB_INFO("笔迹层已切换到 %ls（%dx%d，笔迹=%s）", key.empty() ? L"实时画面" : key.c_str(),
             imageWidth, imageHeight, annotation_.empty() ? "无" : "有");
 }
 
-void MainWindow::SyncAnnotationStyle() {
-    annotation_.SetColor(morePanel_.color());
-    annotation_.SetThickness(morePanel_.penThickness());
-    annotation_.SetEraserRadius(morePanel_.eraserRadius());
+void MainWindow::SyncAnnotationStyle(annotation::StrokeLayer& layer) {
+    layer.SetColor(morePanel_.color());
+    layer.SetThickness(morePanel_.penThickness());
+    layer.SetEraserRadius(morePanel_.eraserRadius());
 }
 
 void MainWindow::UpdateEraserCursor() {
-    if (state_.tool != core::ToolMode::Erase || !state_.pictureAnnotatable() ||
-        !annotation_.valid()) {
+    if (state_.tool != core::ToolMode::Erase) {
+        return;
+    }
+    // 屏幕像素 / 图像像素 的换算比例：普通画面用整体缩放，教学画面用该照片的适配比例
+    float screenScale = 0.0f;
+    if (compareMode_) {
+        const int hit = CompareItemAt(cursorPos_, clientWidth_, clientHeight_);
+        if (hit < 0) {
+            return;
+        }
+        RECT dest = {};
+        if (!CompareItemRect(static_cast<size_t>(hit), clientWidth_, clientHeight_, dest)) {
+            return;
+        }
+        const int imageWidth = compareItems_[static_cast<size_t>(hit)].image.width();
+        if (imageWidth <= 0) {
+            return;
+        }
+        screenScale = static_cast<float>(dest.right - dest.left) / static_cast<float>(imageWidth);
+    } else {
+        if (!state_.pictureAnnotatable() || !annotation_.valid()) {
+            return;
+        }
+        screenScale = ComputeScale();
+    }
+    if (screenScale <= 0.0f) {
         return;
     }
     // 橡皮半径是图像像素，换算到屏幕上才是实际擦除面积
-    const int diameter =
-        static_cast<int>(annotation_.eraserRadius() * 2.0f * ComputeScale() + 0.5f);
+    const int diameter = static_cast<int>(morePanel_.eraserRadius() * 2.0f * screenScale + 0.5f);
     if (diameter < 6) {
         return;
     }
@@ -708,7 +752,7 @@ void MainWindow::UpdateEraserCursor() {
         return;
     }
 
-    // 圆环纹理：中间白环 + 内外黑色描边，保证在深色与浅色画面上都清晰
+    // 实心圆指示：内部半透明白色填充 + 白色细环 + 外侧黑色描边，保证在深色与浅色画面上都清晰
     const int size = diameter + 6;
     std::vector<uint8_t> pixels(static_cast<size_t>(size) * static_cast<size_t>(size) * 4u, 0);
     const float center = static_cast<float>(size) * 0.5f;
@@ -718,20 +762,25 @@ void MainWindow::UpdateEraserCursor() {
             const float dx = static_cast<float>(x) + 0.5f - center;
             const float dy = static_cast<float>(y) + 0.5f - center;
             const float distance = std::sqrt(dx * dx + dy * dy);
-            const float black = std::min(1.0f, std::max(0.0f, radius + 2.5f - distance)) *
-                                std::min(1.0f, std::max(0.0f, distance - (radius - 2.5f)));
+            const float fill = std::min(1.0f, std::max(0.0f, radius - 1.2f - distance + 0.5f));
             const float white = std::min(1.0f, std::max(0.0f, radius + 1.2f - distance)) *
                                 std::min(1.0f, std::max(0.0f, distance - (radius - 1.2f)));
-            const float alpha = std::max(white, black * 0.7f);
-            if (alpha <= 0.0f) {
+            const float black = std::min(1.0f, std::max(0.0f, radius + 2.5f - distance)) *
+                                std::min(1.0f, std::max(0.0f, distance - (radius + 1.2f)));
+            const float whiteAlpha = std::max(fill * 0.28f, white * 0.85f);
+            const float blackAlpha = black * 0.55f;
+            if (whiteAlpha <= 0.0f && blackAlpha <= 0.0f) {
                 continue;
             }
-            const float value = white > 0.0f ? 1.0f : 0.0f;
+            // 预乘 BGRA：白色需写出颜色分量，黑色仅保留 alpha
+            const bool useWhite = whiteAlpha >= blackAlpha;
+            const float alpha = useWhite ? whiteAlpha : blackAlpha;
+            const uint8_t alphaByte = static_cast<uint8_t>(alpha * 255.0f + 0.5f);
             uint8_t* pixel = pixels.data() + (static_cast<size_t>(y) * size + x) * 4u;
-            pixel[0] = static_cast<uint8_t>(value * alpha * 255.0f + 0.5f);
+            pixel[0] = useWhite ? alphaByte : 0;
             pixel[1] = pixel[0];
             pixel[2] = pixel[0];
-            pixel[3] = static_cast<uint8_t>(alpha * 255.0f + 0.5f);
+            pixel[3] = alphaByte;
         }
     }
     if (eraserTexture_.Upload(pixels.data(), size, size, size * 4)) {
@@ -742,7 +791,15 @@ void MainWindow::UpdateEraserCursor() {
 bool MainWindow::EraserCursorVisible() const {
     // 仅在按住左键擦除时显示圆形范围指示
     if (!cursorInside_ || !annotating_ || state_.tool != core::ToolMode::Erase ||
-        !state_.pictureAnnotatable() || !eraserTexture_.valid()) {
+        !eraserTexture_.valid()) {
+        return false;
+    }
+    if (compareMode_) {
+        if (compareAnnotateIndex_ < 0 ||
+            compareAnnotateIndex_ >= static_cast<int>(compareItems_.size())) {
+            return false;
+        }
+    } else if (!state_.pictureAnnotatable()) {
         return false;
     }
     const POINT point = cursorPos_;
@@ -861,12 +918,14 @@ void MainWindow::UpdatePreview() {
     view.offsetX = state_.offsetX;
     view.offsetY = state_.offsetY;
     view.interactive = state_.pictureZoomable();
-    if (annotation_.valid() && annotation_.width() == pictureWidth_ &&
-        annotation_.height() == pictureHeight_) {
-        view.overlayPixels = annotation_.pixels();
-        view.overlayWidth = annotation_.width();
-        view.overlayHeight = annotation_.height();
-        view.overlayStride = annotation_.stride();
+    const gfx::ImageEffect effect = CurrentImageEffect();
+    view.sharpen = effect.sharpen;
+    view.brightness = effect.brightness;
+    if (annotation_.valid() && annotation_.matches(pictureWidth_, pictureHeight_)) {
+        view.overlayPixels = annotation_.bufferPixels();
+        view.overlayWidth = annotation_.bufferWidth();
+        view.overlayHeight = annotation_.bufferHeight();
+        view.overlayStride = annotation_.bufferStride();
         view.overlayVersion = annotation_.version();
     }
     preview_.SetView(view);
@@ -898,6 +957,7 @@ void MainWindow::UploadOverlayTextures() {
         morePanelDirty_ = false;
     }
 
+    UploadAdjustPanelTexture();
     UploadAlbumPanelTexture();
 }
 
@@ -915,6 +975,348 @@ void MainWindow::UploadAlbumPanelTexture() {
     if (canvas.valid()) {
         albumPanelTexture_.Upload(canvas.pixels(), canvas.width(), canvas.height(),
                                   canvas.stride());
+    }
+}
+
+void MainWindow::EnterCompareMode() {
+    if (compareMode_) {
+        return;
+    }
+    // 与单张照片查看互斥：先退出照片查看再进入对比
+    if (AlbumPhotoShown()) {
+        HideAlbumPhoto();
+    }
+    // 释放实时/照片笔迹层：教学模式下改为每张照片各自的笔迹层，
+    // 避免内存中的旧层与教学里修改后的笔迹文件不一致
+    ReleaseAnnotation();
+    compareMode_ = true;
+    ReleaseCompareItems();
+    albumPanel_.SetMode(AlbumPanel::Mode::Compare);
+    albumPanelDirty_ = true;
+    if (deps_.camera != nullptr) {
+        deps_.camera->SetActive(false); // 对比展示时暂停采集
+    }
+    SyncToolbarState();
+    ShowToast(L"对比教学模式：点击照片进行选择");
+    VB_INFO("进入对比教学模式");
+}
+
+void MainWindow::ExitCompareMode() {
+    if (!compareMode_) {
+        return;
+    }
+    SaveCompareAnnotations();
+    compareMode_ = false;
+    ReleaseCompareItems();
+    // 相册面板可能处于收起状态，仍需复位到常规模式
+    albumPanel_.SetMode(AlbumPanel::Mode::Normal);
+    albumPanelDirty_ = true;
+    if (deps_.camera != nullptr) {
+        deps_.camera->SetActive(ShouldCapture());
+    }
+    SyncToolbarState();
+    ShowToast(L"已退出对比教学");
+    VB_INFO("退出对比教学模式");
+}
+
+void MainWindow::ReleaseCompareItems() {
+    // 正在教学画面上书写时被中断，需一并结束书写状态
+    if (annotating_ && compareAnnotateIndex_ >= 0) {
+        annotating_ = false;
+    }
+    compareItems_.clear();
+    compareDragIndex_ = -1;
+    compareAnnotateIndex_ = -1;
+    compareTopZ_ = 0;
+    compareLastClickTick_ = 0;
+    compareLastClickIndex_ = -1;
+}
+
+void MainWindow::SyncCompareSelectionFromPanel() {
+    if (!compareMode_) {
+        return;
+    }
+    const std::vector<size_t>& selection = albumPanel_.selection();
+    // 被取消选择的照片：其笔迹层可能刚编辑过，先落盘再销毁
+    for (size_t i = 0; i < compareItems_.size(); ++i) {
+        const size_t index = compareItems_[i].index;
+        if (std::find(selection.begin(), selection.end(), index) == selection.end()) {
+            SaveCompareAnnotation(i);
+        }
+    }
+    std::vector<CompareItem> updated;
+    updated.reserve(selection.size());
+    for (const size_t index : selection) {
+        // 已加载的图片直接移动复用（含拖动位置与笔迹层），仅为新选中的照片解码原图
+        const auto found = std::find_if(compareItems_.begin(), compareItems_.end(),
+                                        [index](const CompareItem& item) {
+                                            return item.index == index;
+                                        });
+        if (found != compareItems_.end()) {
+            updated.push_back(std::move(*found));
+            continue;
+        }
+        if (index >= photoLibrary_.size()) {
+            continue;
+        }
+        const album::PhotoEntry& entry = photoLibrary_.at(index);
+        CompareItem item;
+        item.index = index;
+        item.name = entry.name;
+        if (!item.image.LoadFromFile(entry.path)) {
+            ShowToast(L"照片加载失败");
+            continue;
+        }
+        item.dirty = true;
+        item.z = ++compareTopZ_; // 新加入的照片默认位于最顶层
+        // 每张照片各自的笔迹层：与全屏查看共用同一笔迹文件
+        item.annotation.Reset(item.image.width(), item.image.height());
+        SyncAnnotationStyle(item.annotation);
+        annotation::LoadFromFile(AnnotationPath(item.name), item.annotation, item.image.width(),
+                                 item.image.height());
+        updated.push_back(std::move(item));
+    }
+    compareItems_ = std::move(updated);
+    if (compareDragIndex_ >= static_cast<int>(compareItems_.size())) {
+        compareDragIndex_ = -1;
+    }
+    if (compareAnnotateIndex_ >= static_cast<int>(compareItems_.size())) {
+        compareAnnotateIndex_ = -1;
+        annotating_ = false;
+    }
+}
+
+void MainWindow::SaveCompareAnnotation(size_t itemIndex) const {
+    if (itemIndex >= compareItems_.size()) {
+        return;
+    }
+    const CompareItem& item = compareItems_[itemIndex];
+    if (item.name.empty() || !item.annotation.valid()) {
+        return;
+    }
+    annotation::SaveToFile(AnnotationPath(item.name), item.annotation);
+}
+
+void MainWindow::SaveCompareAnnotations() const {
+    for (size_t i = 0; i < compareItems_.size(); ++i) {
+        SaveCompareAnnotation(i);
+    }
+}
+
+void MainWindow::ClearCompareAnnotations() {
+    for (CompareItem& item : compareItems_) {
+        if (!item.annotation.valid()) {
+            continue;
+        }
+        item.annotation.Clear();
+        annotation::SaveToFile(AnnotationPath(item.name), item.annotation);
+    }
+}
+
+void MainWindow::UploadCompareTextures() {
+    if (!compareMode_) {
+        return;
+    }
+    for (CompareItem& item : compareItems_) {
+        if (item.dirty && item.image.Valid()) {
+            item.texture.Upload(item.image.pixels(), item.image.width(), item.image.height(),
+                                item.image.stride());
+            item.dirty = false;
+        }
+        // 笔迹层按脏矩形增量上传（首次或整层清空时自动退化为整幅上传）
+        if (!item.annotation.valid()) {
+            continue;
+        }
+        RECT dirty = {};
+        if (item.annotation.TakeDirtyRect(dirty)) {
+            item.annotationTexture.UploadRegion(
+                item.annotation.bufferPixels(), item.annotation.bufferWidth(),
+                item.annotation.bufferHeight(), item.annotation.bufferStride(), dirty);
+        }
+    }
+}
+
+MainWindow::CompareCell MainWindow::CompareCellAt(size_t itemIndex, int windowWidth,
+                                                  int windowHeight) const {
+    CompareCell cell;
+    // 2 列网格平铺：1 张占满，2 张左右并排，3~4 张为 2x2
+    const size_t count = compareItems_.size();
+    if (count == 0 || windowWidth <= 0 || windowHeight <= 0) {
+        return cell;
+    }
+    const size_t columns = count == 1 ? 1 : 2;
+    const size_t rows = (count + columns - 1) / columns;
+    cell.width = static_cast<float>(windowWidth) / static_cast<float>(columns);
+    cell.height = static_cast<float>(windowHeight) / static_cast<float>(rows);
+    cell.centerX = cell.width * static_cast<float>(itemIndex % columns) + cell.width * 0.5f;
+    cell.centerY = cell.height * static_cast<float>(itemIndex / columns) + cell.height * 0.5f;
+    return cell;
+}
+
+std::vector<size_t> MainWindow::CompareDrawOrder() const {
+    std::vector<size_t> order(compareItems_.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+        order[i] = i;
+    }
+    // 层次相同时保持原有先后，绘制结果稳定
+    std::stable_sort(order.begin(), order.end(), [this](size_t a, size_t b) {
+        return compareItems_[a].z < compareItems_[b].z;
+    });
+    return order;
+}
+
+void MainWindow::BringCompareItemToFront(size_t itemIndex) {
+    if (itemIndex >= compareItems_.size()) {
+        return;
+    }
+    compareItems_[itemIndex].z = ++compareTopZ_;
+    VB_INFO("对比教学：第 %zu 张照片已置于最顶层", itemIndex);
+}
+
+bool MainWindow::CompareItemRect(size_t itemIndex, int windowWidth, int windowHeight,
+                                 RECT& dest) const {
+    if (itemIndex >= compareItems_.size() || windowWidth <= 0 || windowHeight <= 0) {
+        return false;
+    }
+    const CompareItem& item = compareItems_[itemIndex];
+    if (!item.texture.valid()) {
+        return false;
+    }
+    const CompareCell cell = CompareCellAt(itemIndex, windowWidth, windowHeight);
+    constexpr float kGap = 6.0f;
+    const float availableWidth = std::max(1.0f, cell.width - kGap * 2.0f);
+    const float availableHeight = std::max(1.0f, cell.height - kGap * 2.0f);
+    const float fit = std::min(availableWidth / static_cast<float>(item.texture.width()),
+                               availableHeight / static_cast<float>(item.texture.height()));
+    // 单独缩放：在本格适配尺寸上再乘以该照片自己的缩放倍率
+    const float drawWidth = static_cast<float>(item.texture.width()) * fit * item.zoom;
+    const float drawHeight = static_cast<float>(item.texture.height()) * fit * item.zoom;
+    const float left = cell.centerX + item.offsetX - drawWidth * 0.5f;
+    const float top = cell.centerY + item.offsetY - drawHeight * 0.5f;
+    dest = {static_cast<LONG>(left), static_cast<LONG>(top), static_cast<LONG>(left + drawWidth),
+            static_cast<LONG>(top + drawHeight)};
+    return true;
+}
+
+int MainWindow::CompareItemAt(POINT point, int windowWidth, int windowHeight) const {
+    // 按绘制顺序逆序命中：最上层（z 最大）的照片优先响应
+    const std::vector<size_t> order = CompareDrawOrder();
+    for (size_t k = order.size(); k > 0; --k) {
+        const size_t i = order[k - 1];
+        RECT dest = {};
+        if (!CompareItemRect(i, windowWidth, windowHeight, dest)) {
+            continue;
+        }
+        if (point.x >= dest.left && point.x < dest.right && point.y >= dest.top &&
+            point.y < dest.bottom) {
+            return static_cast<int>(i);
+        }
+    }
+    return -1;
+}
+
+void MainWindow::CompareWindowToImage(size_t itemIndex, POINT point, int windowWidth,
+                                      int windowHeight, float* imageX, float* imageY) const {
+    if (imageX != nullptr) {
+        *imageX = 0.0f;
+    }
+    if (imageY != nullptr) {
+        *imageY = 0.0f;
+    }
+    RECT dest = {};
+    if (!CompareItemRect(itemIndex, windowWidth, windowHeight, dest)) {
+        return;
+    }
+    const CompareItem& item = compareItems_[itemIndex];
+    const float destWidth = static_cast<float>(dest.right - dest.left);
+    const float destHeight = static_cast<float>(dest.bottom - dest.top);
+    if (destWidth <= 0.0f || destHeight <= 0.0f) {
+        return;
+    }
+    if (imageX != nullptr) {
+        *imageX = static_cast<float>(point.x - dest.left) / destWidth *
+                  static_cast<float>(item.image.width());
+    }
+    if (imageY != nullptr) {
+        *imageY = static_cast<float>(point.y - dest.top) / destHeight *
+                  static_cast<float>(item.image.height());
+    }
+}
+
+void MainWindow::ClampCompareOffset(size_t itemIndex, int windowWidth, int windowHeight) {
+    if (itemIndex >= compareItems_.size() || windowWidth <= 0 || windowHeight <= 0) {
+        return;
+    }
+    CompareItem& item = compareItems_[itemIndex];
+    if (!item.texture.valid()) {
+        return;
+    }
+    // 以「照片至少留有一部分在窗口内」为界：既能拖到边缘，也能放大后查看局部
+    constexpr float kMinVisible = 60.0f;
+    const CompareCell cell = CompareCellAt(itemIndex, windowWidth, windowHeight);
+    constexpr float kGap = 6.0f;
+    const float availableWidth = std::max(1.0f, cell.width - kGap * 2.0f);
+    const float availableHeight = std::max(1.0f, cell.height - kGap * 2.0f);
+    const float fit = std::min(availableWidth / static_cast<float>(item.texture.width()),
+                               availableHeight / static_cast<float>(item.texture.height()));
+    const float drawWidth = static_cast<float>(item.texture.width()) * fit * item.zoom;
+    const float drawHeight = static_cast<float>(item.texture.height()) * fit * item.zoom;
+    const float minCenterX = kMinVisible - drawWidth * 0.5f;
+    const float maxCenterX = static_cast<float>(windowWidth) - kMinVisible + drawWidth * 0.5f;
+    const float minCenterY = kMinVisible - drawHeight * 0.5f;
+    const float maxCenterY = static_cast<float>(windowHeight) - kMinVisible + drawHeight * 0.5f;
+    item.offsetX = std::max(minCenterX - cell.centerX,
+                            std::min(maxCenterX - cell.centerX, item.offsetX));
+    item.offsetY = std::max(minCenterY - cell.centerY,
+                            std::min(maxCenterY - cell.centerY, item.offsetY));
+}
+
+void MainWindow::ZoomCompareItem(size_t itemIndex, int anchorX, int anchorY, float factor) {
+    if (itemIndex >= compareItems_.size() || factor <= 0.0f || clientWidth_ <= 0 ||
+        clientHeight_ <= 0) {
+        return;
+    }
+    constexpr float kMinZoom = 0.2f;
+    constexpr float kMaxZoom = 10.0f;
+    CompareItem& item = compareItems_[itemIndex];
+    const float oldZoom = item.zoom;
+    const float newZoom = std::max(kMinZoom, std::min(kMaxZoom, oldZoom * factor));
+    if (newZoom == oldZoom) {
+        return;
+    }
+    // 照片始终以所在格中心为基准，因此格中心不随缩放变化
+    const CompareCell cell = CompareCellAt(itemIndex, clientWidth_, clientHeight_);
+    // 以锚点为不动点：anchor - C' = (anchor - C) * (newZoom / oldZoom)
+    const float k = newZoom / oldZoom;
+    const float centerX = cell.centerX + item.offsetX;
+    const float centerY = cell.centerY + item.offsetY;
+    const float newCenterX = static_cast<float>(anchorX) - (static_cast<float>(anchorX) - centerX) * k;
+    const float newCenterY = static_cast<float>(anchorY) - (static_cast<float>(anchorY) - centerY) * k;
+    item.offsetX = newCenterX - cell.centerX;
+    item.offsetY = newCenterY - cell.centerY;
+    item.zoom = newZoom;
+    ClampCompareOffset(itemIndex, clientWidth_, clientHeight_);
+}
+
+void MainWindow::RenderCompareGrid(int windowWidth, int windowHeight) {
+    if (compareItems_.empty()) {
+        return;
+    }
+    // 照片是静态展示内容，只应用锐化，不叠加显示端亮度
+    gfx::ImageEffect effect;
+    effect.sharpen = sharpenStrength_;
+
+    for (const size_t i : CompareDrawOrder()) {
+        const CompareItem& item = compareItems_[i];
+        RECT dest = {};
+        if (!CompareItemRect(i, windowWidth, windowHeight, dest)) {
+            continue;
+        }
+        renderer_.DrawTexture(item.texture, dest, 0.0f, gfx::Color::White(), effect);
+        // 笔迹层与照片同矩形绘制，因此照片被拖动时笔迹跟随
+        if (item.annotationTexture.valid()) {
+            renderer_.DrawTexture(item.annotationTexture, dest);
+        }
     }
 }
 
@@ -938,21 +1340,30 @@ void MainWindow::Relayout() {
         clientHeight_ = client.bottom;
     }
     toolbar_.Layout(clientWidth_, clientHeight_);
-    preview_.Layout(clientWidth_, clientHeight_, toolbar_.bounds());
+    preview_.Layout(clientWidth_, clientHeight_);
     // “更多”标签贴在所选模式按钮外侧（底部功能栏为正上方，两侧功能栏为左侧）
     const int anchorIndex = state_.tool == core::ToolMode::Erase
                                 ? static_cast<int>(ToolButtonId::Erase)
                                 : static_cast<int>(ToolButtonId::Annotate);
     morePanel_.Layout(toolbar_.bounds(), toolbar_.buttonRect(anchorIndex), toolbar_.vertical(),
                       clientWidth_, clientHeight_);
+    // 画面调节浮层贴在「画面调节」按钮外侧
+    adjustPanel_.Layout(toolbar_.bounds(),
+                        toolbar_.buttonRect(static_cast<int>(ToolButtonId::Adjust)),
+                        toolbar_.vertical(), clientWidth_, clientHeight_);
     albumPanel_.Layout(toolbar_.bounds(), clientWidth_, clientHeight_);
     if (settingsDialog_.isOpen()) {
         settingsDialog_.Relayout(clientWidth_, clientHeight_);
     }
     // 窗口尺寸变化后位移上限随之变化，需重新收敛
     ClampOffsets();
+    // 教学网格中的照片位移同样收敛，避免窗口缩小后拖丢
+    for (size_t i = 0; i < compareItems_.size(); ++i) {
+        ClampCompareOffset(i, clientWidth_, clientHeight_);
+    }
     toolbarDirty_ = true;
     morePanelDirty_ = true;
+    adjustPanelDirty_ = true;
     albumPanelDirty_ = true;
 }
 
@@ -965,10 +1376,11 @@ void MainWindow::SyncToolbarState() {
                        state_.tool == core::ToolMode::Annotate);
     toolbar_.SetActive(static_cast<int>(ToolButtonId::Erase),
                        state_.tool == core::ToolMode::Erase);
-    toolbar_.SetActive(static_cast<int>(ToolButtonId::Lock), state_.locked);
-    // 相册按钮：面板展开或正在查看照片时高亮
+    // 画面调节面板展开时高亮
+    toolbar_.SetActive(static_cast<int>(ToolButtonId::Adjust), adjustPanel_.isOpen());
+    // 相册按钮：面板展开、正在查看照片或处于对比教学时高亮
     toolbar_.SetActive(static_cast<int>(ToolButtonId::Album),
-                       albumPanelOpen || AlbumPhotoShown());
+                       albumPanelOpen || AlbumPhotoShown() || compareMode_);
     // 相册面板与照片查看时功能栏仍可用，仅设置框期间禁用
     toolbar_.SetEnabled(state_.view != core::ViewMode::Settings);
     // 仅在全屏查看照片时，“拍照”变为“返回相机”
@@ -1010,9 +1422,50 @@ void MainWindow::OnMouseMove(int x, int y) {
     // 粗细滑块拖动：按住时连续跟随鼠标
     if (moreSliderDrag_) {
         if (morePanel_.PenSliderFromPoint(point)) {
-            SyncAnnotationStyle();
+            SyncAnnotationStyle(annotation_);
             morePanelDirty_ = true;
         }
+        return;
+    }
+
+    // 亮度滑块拖动：按住时连续跟随鼠标
+    if (adjustSliderDrag_) {
+        if (adjustPanel_.BrightnessSliderFromPoint(point)) {
+            ApplyBrightness(adjustPanel_.brightness());
+        }
+        return;
+    }
+
+    // 画面调节面板：悬停反馈优先于功能栏
+    if (adjustPanel_.isOpen()) {
+        const AdjustPanelHit hit = adjustPanel_.HitTest(point);
+        if (hit.kind != adjustPanelHover_) {
+            adjustPanelHover_ = hit.kind;
+            adjustPanel_.SetHover(hit.kind);
+            adjustPanelDirty_ = true;
+        }
+        if (adjustPanel_.ContainsPoint(point)) {
+            return;
+        }
+    }
+
+    // 对比教学：拖动单张照片 / 在该照片的笔迹层上书写
+    if (compareDragIndex_ >= 0 && compareDragIndex_ < static_cast<int>(compareItems_.size())) {
+        CompareItem& item = compareItems_[static_cast<size_t>(compareDragIndex_)];
+        item.offsetX += static_cast<float>(x - compareDragLast_.x);
+        item.offsetY += static_cast<float>(y - compareDragLast_.y);
+        compareDragLast_ = point;
+        ClampCompareOffset(static_cast<size_t>(compareDragIndex_), clientWidth_, clientHeight_);
+        return;
+    }
+    if (annotating_ && compareAnnotateIndex_ >= 0 &&
+        compareAnnotateIndex_ < static_cast<int>(compareItems_.size())) {
+        const size_t itemIndex = static_cast<size_t>(compareAnnotateIndex_);
+        CompareItem& item = compareItems_[itemIndex];
+        float imageX = 0.0f;
+        float imageY = 0.0f;
+        CompareWindowToImage(itemIndex, point, clientWidth_, clientHeight_, &imageX, &imageY);
+        item.annotation.PointerMove(imageX, imageY);
         return;
     }
 
@@ -1078,12 +1531,33 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
             const AlbumPanelHit hit = albumPanel_.HitTest(point);
             albumPressedHit_ = hit;
             if (hit.kind == AlbumPanelHit::Kind::Thumbnail ||
+                hit.kind == AlbumPanelHit::Kind::SelectToggle ||
                 hit.kind == AlbumPanelHit::Kind::None) {
                 albumPanel_.BeginDrag(x);
             }
             albumPanelPressed_ = true;
             albumPanelDirty_ = true;
             return;
+        }
+
+        // 0.5 “画面调节”面板展开时优先处理其内容
+        if (adjustPanel_.isOpen()) {
+            const AdjustPanelHit hit = adjustPanel_.HitTest(point);
+            if (hit.kind == AdjustPanelHit::Kind::Brightness) {
+                // 亮度滑块：按下即定位，并支持按住拖动连续调整
+                adjustSliderDrag_ = true;
+                if (adjustPanel_.BrightnessSliderFromPoint(point)) {
+                    ApplyBrightness(adjustPanel_.brightness());
+                }
+                return;
+            }
+            if (hit.kind != AdjustPanelHit::Kind::None) {
+                HandleAdjustPanelHit(hit);
+                return;
+            }
+            if (adjustPanel_.ContainsPoint(point)) {
+                return;
+            }
         }
 
         // 1. “更多”面板展开时优先处理其内容
@@ -1128,10 +1602,60 @@ void MainWindow::OnButtonDown(int x, int y, bool middle) {
             return;
         }
 
+        // 4.5 点击面板与功能栏以外的空白区域：收起“画面调节”面板
+        if (adjustPanel_.isOpen()) {
+            HideAdjustPanel();
+            return;
+        }
+
         // 5. 相册面板展开时，点击面板与功能栏以外的空白区域收起面板；
         //    仅收起面板，正在全屏查看的照片继续展示
         if (albumPanel_.isOpen()) {
             HideAlbumPanel();
+            return;
+        }
+
+        // 5.5 对比教学：在照片网格上单独拖动某张照片，或用批注/橡皮在其笔迹层上书写
+        if (compareMode_) {
+            const int hit = CompareItemAt(point, clientWidth_, clientHeight_);
+            if (hit < 0) {
+                return;
+            }
+            const size_t itemIndex = static_cast<size_t>(hit);
+            if (state_.tool == core::ToolMode::Select) {
+                // 双击同一张照片：置于最顶层（不再开始拖动）
+                const ULONGLONG now = ::GetTickCount64();
+                const int slop = std::max(4, ::GetSystemMetrics(SM_CXDOUBLECLK) / 2);
+                const int dx = x - compareLastClickPos_.x;
+                const int dy = y - compareLastClickPos_.y;
+                const bool inPlace = dx <= slop && dx >= -slop && dy <= slop && dy >= -slop;
+                if (compareLastClickIndex_ == hit && compareLastClickTick_ != 0 && inPlace &&
+                    now - compareLastClickTick_ <= ::GetDoubleClickTime()) {
+                    BringCompareItemToFront(itemIndex);
+                    // 复位，避免第三次点击被识别为又一次双击
+                    compareLastClickTick_ = 0;
+                    compareLastClickIndex_ = -1;
+                    return;
+                }
+                compareLastClickTick_ = now;
+                compareLastClickPos_ = point;
+                compareLastClickIndex_ = hit;
+                compareDragIndex_ = hit;
+                compareDragLast_ = point;
+            } else {
+                CompareItem& item = compareItems_[itemIndex];
+                if (item.annotation.valid()) {
+                    SyncAnnotationStyle(item.annotation);
+                    float imageX = 0.0f;
+                    float imageY = 0.0f;
+                    CompareWindowToImage(itemIndex, point, clientWidth_, clientHeight_, &imageX,
+                                         &imageY);
+                    item.annotation.PointerDown(imageX, imageY,
+                                                state_.tool == core::ToolMode::Erase);
+                    compareAnnotateIndex_ = hit;
+                    annotating_ = true;
+                }
+            }
             return;
         }
 
@@ -1180,6 +1704,27 @@ void MainWindow::OnButtonUp(int x, int y) {
         return;
     }
 
+    if (adjustSliderDrag_) {
+        adjustSliderDrag_ = false;
+        return;
+    }
+
+    // 对比教学：结束照片拖动 / 结束笔迹书写并落盘
+    if (compareDragIndex_ >= 0) {
+        compareDragIndex_ = -1;
+        return;
+    }
+    if (annotating_ && compareAnnotateIndex_ >= 0) {
+        const size_t itemIndex = static_cast<size_t>(compareAnnotateIndex_);
+        if (itemIndex < compareItems_.size()) {
+            compareItems_[itemIndex].annotation.PointerUp();
+            SaveCompareAnnotation(itemIndex);
+        }
+        compareAnnotateIndex_ = -1;
+        annotating_ = false;
+        return;
+    }
+
     // 相册面板：先在抬起位置重新命中，避免误触
     if (albumPanelPressed_) {
         albumPanelPressed_ = false;
@@ -1190,10 +1735,12 @@ void MainWindow::OnButtonUp(int x, int y) {
             albumPanel_.EndDrag();
         }
         albumPanelDirty_ = true;
-        if (pressed.kind == AlbumPanelHit::Kind::Thumbnail && !dragged) {
+        if ((pressed.kind == AlbumPanelHit::Kind::Thumbnail ||
+             pressed.kind == AlbumPanelHit::Kind::SelectToggle) && !dragged) {
             HandleAlbumPanelHit(pressed);
         } else if (pressed.kind != AlbumPanelHit::Kind::None &&
-                   pressed.kind != AlbumPanelHit::Kind::Thumbnail) {
+                   pressed.kind != AlbumPanelHit::Kind::Thumbnail &&
+                   pressed.kind != AlbumPanelHit::Kind::SelectToggle) {
             const POINT point = {x, y};
             const AlbumPanelHit released = albumPanel_.HitTest(point);
             if (released.kind == pressed.kind && released.index == pressed.index) {
@@ -1229,6 +1776,15 @@ void MainWindow::OnMouseWheel(int delta, int x, int y) {
         constexpr int kAlbumWheelStep = 140;
         albumPanel_.ScrollBy(-delta / WHEEL_DELTA * static_cast<int>(kAlbumWheelStep * uiScale_));
         albumPanelDirty_ = true;
+        return;
+    }
+    // 对比教学：滚轮单独缩放光标所在的那张照片
+    if (compareMode_) {
+        const int hit = CompareItemAt(point, clientWidth_, clientHeight_);
+        if (hit >= 0) {
+            ZoomCompareItem(static_cast<size_t>(hit), x, y,
+                            std::pow(1.1f, static_cast<float>(delta) / WHEEL_DELTA));
+        }
         return;
     }
     // 相册照片同样支持缩放/拖动（仅不支持批注与拍照）
@@ -1423,27 +1979,37 @@ void MainWindow::UpdateTouchGesture() {
         return;
     }
 
-    // 设置面板打开或画面不可缩放时不响应画面手势
-    if (settingsDialog_.isOpen() || !state_.pictureZoomable()) {
+    // 设置面板打开时不响应画面手势；对比教学的照片缩放与摄像头可用性无关
+    if (settingsDialog_.isOpen() || (!state_.pictureZoomable() && !compareMode_)) {
         return;
     }
 
     const POINT centroid = TouchCentroid();
     const float distance = TouchDistance();
     if (touchGestureMaxCount_ >= 3) {
-        // 三指及以上：平移画面（本次手势已确认为拖动，抬起一指后仍继续平移）
-        const int deltaX = centroid.x - touchLastCentroid_.x;
-        const int deltaY = centroid.y - touchLastCentroid_.y;
-        if (deltaX != 0 || deltaY != 0) {
-            state_.offsetX += static_cast<float>(deltaX);
-            state_.offsetY += static_cast<float>(deltaY);
-            ClampOffsets();
+        // 三指及以上：平移画面（对比教学画面由照片网格占用，无整体平移目标）
+        if (!compareMode_) {
+            const int deltaX = centroid.x - touchLastCentroid_.x;
+            const int deltaY = centroid.y - touchLastCentroid_.y;
+            if (deltaX != 0 || deltaY != 0) {
+                state_.offsetX += static_cast<float>(deltaX);
+                state_.offsetY += static_cast<float>(deltaY);
+                ClampOffsets();
+            }
         }
     } else if (touchLastDistance_ > 1.0f && distance > 1.0f) {
         // 双指捏合：按两指距离变化比例缩放，锚点为两指中心
         const float factor = distance / touchLastDistance_;
         if (factor > 0.0f && factor < 100.0f) {
-            ApplyZoomAt(centroid.x, centroid.y, factor);
+            if (compareMode_) {
+                // 对比教学：单独缩放两指中心所在的那张照片
+                const int hit = CompareItemAt(centroid, clientWidth_, clientHeight_);
+                if (hit >= 0) {
+                    ZoomCompareItem(static_cast<size_t>(hit), centroid.x, centroid.y, factor);
+                }
+            } else {
+                ApplyZoomAt(centroid.x, centroid.y, factor);
+            }
         }
     }
     touchLastDistance_ = distance;
@@ -1485,13 +2051,29 @@ void MainWindow::ClampOffsets() {
 }
 
 void MainWindow::HandleToolButton(ToolButtonId id) {
-    // 全屏查看照片时：批注/橡皮/旋转/缩放拖动/设置都可用，仅“锁定”不适用
+    // 对比教学模式：画面为照片网格，支持选择/批注/橡皮与相册、设置、窗口控制
+    if (compareMode_) {
+        switch (id) {
+        case ToolButtonId::Select:
+        case ToolButtonId::Annotate:
+        case ToolButtonId::Erase:
+        case ToolButtonId::Album:
+        case ToolButtonId::Settings:
+        case ToolButtonId::Minimize:
+        case ToolButtonId::Exit:
+            break;
+        default:
+            ShowToast(L"对比教学中不支持该操作");
+            return;
+        }
+    }
+    // 全屏查看照片时：批注/橡皮/画面调节/缩放拖动/设置都可用，其余不适用
     if (AlbumPhotoShown()) {
         switch (id) {
         case ToolButtonId::Select:
         case ToolButtonId::Annotate:
         case ToolButtonId::Erase:
-        case ToolButtonId::Rotate:
+        case ToolButtonId::Adjust:
         case ToolButtonId::Shoot: // 照片查看时该按钮是“返回相机”
         case ToolButtonId::Album:
         case ToolButtonId::Settings:
@@ -1509,32 +2091,19 @@ void MainWindow::HandleToolButton(ToolButtonId id) {
         ApplyToolMode(core::ToolMode::Select);
         break;
     case ToolButtonId::Annotate:
-        ApplyToolMode(core::ToolMode::Annotate);
+        // 再次点击同一模式回到选择模式，便于快速退出批注
+        ApplyToolMode(state_.tool == core::ToolMode::Annotate ? core::ToolMode::Select
+                                                              : core::ToolMode::Annotate);
         break;
     case ToolButtonId::Erase:
-        ApplyToolMode(core::ToolMode::Erase);
+        ApplyToolMode(state_.tool == core::ToolMode::Erase ? core::ToolMode::Select
+                                                           : core::ToolMode::Erase);
         break;
-    case ToolButtonId::Rotate:
-        if (!state_.pictureZoomable()) {
-            ShowToast(L"无摄像头可用，无法旋转画面");
-            break;
-        }
-        state_.rotationQuarter = (state_.rotationQuarter + 1) % 4;
-        // 画面顺时针旋转，同步旋转位移以保持视野位置
-        std::swap(state_.offsetX, state_.offsetY);
-        state_.offsetX = -state_.offsetX;
-        ClampOffsets();
-        ShowToast(L"画面已旋转 90°");
-        break;
-    case ToolButtonId::Lock:
-        state_.locked = !state_.locked;
-        // 锁定即停止拉流（保留设备句柄，解锁后迅速恢复）
-        if (deps_.camera != nullptr) {
-            deps_.camera->SetActive(!state_.locked);
-        }
-        ShowToast(state_.locked ? L"画面已锁定" : L"已恢复实时画面");
-        if (!state_.locked && deps_.camera != nullptr && !deps_.camera->IsOpen()) {
-            state_.picture = core::PictureSource::None;
+    case ToolButtonId::Adjust:
+        if (adjustPanel_.isOpen()) {
+            HideAdjustPanel();
+        } else {
+            OpenAdjustPanel();
         }
         break;
     case ToolButtonId::Shoot:
@@ -1568,12 +2137,146 @@ void MainWindow::HandleToolButton(ToolButtonId id) {
     SyncToolbarState();
 }
 
-void MainWindow::ApplyToolMode(core::ToolMode mode) {
-    // 相册面板与批注/橡皮互斥，切换工具模式时收起面板
+void MainWindow::ApplyRotate() {
+    if (!state_.pictureZoomable()) {
+        ShowToast(L"无摄像头可用，无法旋转画面");
+        return;
+    }
+    state_.rotationQuarter = (state_.rotationQuarter + 1) % 4;
+    // 画面顺时针旋转，同步旋转位移以保持视野位置
+    std::swap(state_.offsetX, state_.offsetY);
+    state_.offsetX = -state_.offsetX;
+    ClampOffsets();
+    ShowToast(L"画面已旋转 90°");
+}
+
+void MainWindow::ToggleLock() {
+    if (AlbumPhotoShown()) {
+        ShowToast(L"照片查看中不支持锁定");
+        return;
+    }
+    state_.locked = !state_.locked;
+    // 锁定即停止拉流（保留设备句柄，解锁后迅速恢复）
+    if (deps_.camera != nullptr) {
+        deps_.camera->SetActive(!state_.locked);
+    }
+    ShowToast(state_.locked ? L"画面已锁定" : L"已恢复实时画面");
+    if (!state_.locked && deps_.camera != nullptr && !deps_.camera->IsOpen()) {
+        state_.picture = core::PictureSource::None;
+    }
+    adjustPanel_.SetLocked(state_.locked);
+    adjustPanelDirty_ = true;
+    SyncToolbarState();
+}
+
+void MainWindow::ApplyBrightness(int percent) {
+    percent = std::max(0, std::min(100, percent));
+    adjustPanel_.SetBrightness(percent);
+    adjustPanelDirty_ = true;
+    const bool deviceBrightness =
+        deps_.camera != nullptr && deps_.camera->IsOpen() && deps_.camera->BrightnessSupported();
+    if (deviceBrightness && deps_.camera->SetBrightness(percent)) {
+        displayBrightness_ = false;
+    } else {
+        // 设备不支持亮度控制：改为显示端调节
+        displayBrightness_ = true;
+    }
+    adjustPanel_.SetDeviceBrightness(!displayBrightness_);
+    if (percent != brightnessPercent_) {
+        brightnessPercent_ = percent;
+        VB_INFO("亮度已调整: %d%%（%s）", percent, displayBrightness_ ? "显示端" : "设备端");
+    }
+}
+
+gfx::ImageEffect MainWindow::CurrentImageEffect() const {
+    gfx::ImageEffect effect;
+    effect.sharpen = sharpenStrength_;
+    // 显示端亮度按 50% 为中性点映射到 0.5~1.5 倍
+    if (displayBrightness_ && !AlbumPhotoShown()) {
+        effect.brightness = 0.5f + static_cast<float>(brightnessPercent_) / 100.0f;
+    }
+    return effect;
+}
+
+void MainWindow::ApplyUiFont() {
+    const std::wstring family =
+        deps_.configStore != nullptr ? deps_.configStore->Get().fontFamily : std::wstring();
+    if (OverlayCanvas::FontFamily() == family) {
+        return;
+    }
+    OverlayCanvas::SetFontFamily(family);
+    // 字体变化后所有面板需要重新绘制（文字宽度也随之变化）
+    toolbarDirty_ = true;
+    morePanelDirty_ = true;
+    albumPanelDirty_ = true;
+    adjustPanelDirty_ = true;
+    settingsDialog_.MarkDirty();
+}
+
+void MainWindow::OpenAdjustPanel() {
+    if (adjustPanel_.isOpen()) {
+        return;
+    }
+    // 与相册面板互斥，避免两个浮层重叠
     if (albumPanel_.isOpen()) {
         HideAlbumPanel();
     }
-    if (mode != core::ToolMode::Select && !state_.pictureAnnotatable()) {
+    adjustPanel_.SetLocked(state_.locked);
+    adjustPanel_.SetBrightness(brightnessPercent_);
+    adjustPanel_.SetDeviceBrightness(!displayBrightness_);
+    adjustPanel_.SetOpen(true);
+    adjustPanelDirty_ = true;
+    SyncToolbarState();
+    VB_INFO("展开画面调节面板");
+}
+
+void MainWindow::HideAdjustPanel() {
+    if (!adjustPanel_.isOpen()) {
+        return;
+    }
+    adjustPanel_.SetOpen(false);
+    adjustPanelDirty_ = true;
+    SyncToolbarState();
+}
+
+void MainWindow::UploadAdjustPanelTexture() {
+    if (!adjustPanelDirty_) {
+        return;
+    }
+    adjustPanelDirty_ = false;
+    if (!adjustPanel_.isOpen()) {
+        adjustPanelTexture_.Destroy();
+        return;
+    }
+    adjustPanel_.Render();
+    const OverlayCanvas& canvas = adjustPanel_.canvas();
+    if (canvas.valid()) {
+        adjustPanelTexture_.Upload(canvas.pixels(), canvas.width(), canvas.height(),
+                                   canvas.stride());
+    }
+}
+
+void MainWindow::HandleAdjustPanelHit(const AdjustPanelHit& hit) {
+    switch (hit.kind) {
+    case AdjustPanelHit::Kind::Lock:
+        ToggleLock();
+        break;
+    case AdjustPanelHit::Kind::Rotate:
+        ApplyRotate();
+        break;
+    default:
+        break;
+    }
+}
+
+void MainWindow::ApplyToolMode(core::ToolMode mode) {
+    // 相册面板与批注/橡皮互斥，切换工具模式时收起面板；
+    // 对比教学时相册面板用于选片，保持展开
+    if (albumPanel_.isOpen() && !compareMode_) {
+        HideAlbumPanel();
+    }
+    // 对比教学的批注作用于照片网格，与摄像头可用性无关
+    if (mode != core::ToolMode::Select && !compareMode_ && !state_.pictureAnnotatable()) {
         ShowToast(L"无摄像头可用，无法批注");
         return;
     }
@@ -1644,8 +2347,8 @@ void MainWindow::FinishSettingsDialog() {
 }
 
 bool MainWindow::ShouldCapture() const {
-    // 锁定画面或正在查看照片时停止拉流（保留设备句柄，恢复迅速）
-    return !state_.locked && !AlbumPhotoShown();
+    // 锁定画面、查看照片或对比教学时停止拉流（保留设备句柄，恢复迅速）
+    return !state_.locked && !AlbumPhotoShown() && !compareMode_;
 }
 
 float MainWindow::ComputeUiScale() const {
@@ -1671,6 +2374,7 @@ void MainWindow::ApplyUiScale() {
     toolbar_.SetScale(uiScale_);
     preview_.SetScale(uiScale_);
     morePanel_.SetScale(uiScale_);
+    adjustPanel_.SetScale(uiScale_);
     albumPanel_.SetScale(uiScale_);
     VB_INFO("界面缩放已更新: %.2f", uiScale_);
 }
@@ -1682,7 +2386,10 @@ void MainWindow::ApplyConfigurationFromStore() {
     const core::AppConfig& config = deps_.configStore->Get();
     toolbar_.SetVertical(config.IsToolbarVertical());
     gl_.SetVsync(config.render.vsync);
-    // GUI 大小可能变化：先重算缩放再重排
+    // 默认旋转方向、GUI 大小、字体族与锐化等级可能变化：先应用再重排
+    state_.rotationQuarter = config.rotationQuarter;
+    sharpenStrength_ = kSharpenStrengths[std::max(0, std::min(3, config.render.sharpenLevel))];
+    ApplyUiFont();
     ApplyUiScale();
     Relayout();
     SyncToolbarState();
@@ -1690,29 +2397,40 @@ void MainWindow::ApplyConfigurationFromStore() {
     const std::string guiScaleText = config.guiScaleAuto
                                          ? std::string("自适应")
                                          : FormatA("%.0f%%", config.guiScale * 100.0);
-    VB_INFO("设置已应用: 功能栏=%s, GUI 大小=%s, 垂直同步=%s, 临时目录=%ls",
-            config.IsToolbarVertical() ? "两侧" : "底部", guiScaleText.c_str(),
-            config.render.vsync ? "开" : "关", deps_.configStore->PhotoDir().c_str());
+    VB_INFO("设置已应用: 功能栏=%s, GUI 大小=%s, 字体=%ls, 锐化=%d, 垂直同步=%s, 临时目录=%ls",
+            config.IsToolbarVertical() ? "纵向（右侧）" : "底部", guiScaleText.c_str(),
+            config.fontFamily.empty() ? L"(默认)" : config.fontFamily.c_str(),
+            config.render.sharpenLevel, config.render.vsync ? "开" : "关",
+            deps_.configStore->PhotoDir().c_str());
 }
 
 void MainWindow::HandleMorePanelHit(const MorePanelHit& hit) {
     switch (hit.kind) {
     case MorePanelHit::Kind::Color:
         morePanel_.SelectColor(hit.index);
-        SyncAnnotationStyle();
+        SyncAnnotationStyle(annotation_);
         morePanelDirty_ = true;
         break;
     case MorePanelHit::Kind::PenThickness:
         morePanel_.SetPenThickness(hit.index);
-        SyncAnnotationStyle();
+        SyncAnnotationStyle(annotation_);
         morePanelDirty_ = true;
         break;
     case MorePanelHit::Kind::EraserSize:
         morePanel_.SelectEraserSize(hit.index);
-        SyncAnnotationStyle();
+        SyncAnnotationStyle(annotation_);
         morePanelDirty_ = true;
         break;
     case MorePanelHit::Kind::ClearAll:
+        if (compareMode_) {
+            // 对比教学：清除全部照片的笔迹
+            ClearCompareAnnotations();
+            morePanel_.SetOpen(false);
+            morePanelDirty_ = true;
+            ShowToast(L"教学画面笔迹已全部清除");
+            VB_INFO("对比教学：已清除全部照片笔迹");
+            break;
+        }
         annotation_.Clear();
         SaveAnnotation(); // 笔迹清空后同步删除对应文件
         morePanel_.SetOpen(false);
@@ -1746,6 +2464,10 @@ void MainWindow::OpenAlbumPanel() {
     albumPressedHit_ = AlbumPanelHit();
     albumPanelPressed_ = false;
     albumPanel_.SetOpen(true);
+    // 对比教学中重开面板：按（可能已刷新的）列表重新对齐所选照片
+    if (compareMode_) {
+        SyncCompareSelectionFromPanel();
+    }
 
     // “更多”面板与相册面板互斥
     morePanel_.SetOpen(false);
@@ -1765,7 +2487,7 @@ void MainWindow::HideAlbumPanel() {
     if (!albumPanel_.isOpen()) {
         return;
     }
-    // 仅收起面板：画面与采集状态（含正在查看的照片）保持不变
+    // 仅收起面板：画面与采集状态（含正在查看的照片、对比教学模式）保持不变
     albumPanel_.SetOpen(false);
     albumPanel_.SetHover(AlbumPanelHit());
     albumPressedHit_ = AlbumPanelHit();
@@ -1915,6 +2637,30 @@ void MainWindow::HandleAlbumPanelHit(const AlbumPanelHit& hit) {
         albumPanel_.SetComposeAnnotation(!albumPanel_.composeAnnotation());
         VB_INFO("导出合成笔迹已%s", albumPanel_.composeAnnotation() ? "开启" : "关闭");
         break;
+    case AlbumPanelHit::Kind::Compare:
+        if (compareMode_) {
+            ExitCompareMode();
+        } else {
+            EnterCompareMode();
+        }
+        break;
+    case AlbumPanelHit::Kind::SelectToggle:
+        if (!albumPanel_.ToggleSelection(hit.index)) {
+            ShowToast(FormatW(L"对比教学最多同时展示 %llu 张",
+                              static_cast<unsigned long long>(AlbumPanel::kMaxSelection)));
+        }
+        if (compareMode_) {
+            SyncCompareSelectionFromPanel();
+            SyncToolbarState();
+        }
+        break;
+    case AlbumPanelHit::Kind::ConfirmSelect:
+        ConfirmSelectedPhotosSave();
+        break;
+    case AlbumPanelHit::Kind::CancelSelect:
+        albumPanel_.SetMode(AlbumPanel::Mode::Normal);
+        ShowToast(L"已取消选择");
+        break;
     default:
         break;
     }
@@ -1989,20 +2735,6 @@ bool MainWindow::ExportPhoto(size_t index, const std::wstring& target, bool with
     return true;
 }
 
-size_t MainWindow::ExportAlbumPhotosTo(const std::wstring& folder, bool withAnnotation) {
-    size_t saved = 0;
-    for (size_t i = 0; i < photoLibrary_.size(); ++i) {
-        const std::wstring target =
-            UniqueTargetPath(paths::JoinPath(folder, photoLibrary_.at(i).name));
-        if (ExportPhoto(i, target, withAnnotation)) {
-            ++saved;
-        }
-    }
-    VB_INFO("批量保存照片: %zu/%zu → %ls（%s笔迹）", saved, photoLibrary_.size(), folder.c_str(),
-            withAnnotation ? "含" : "不含");
-    return saved;
-}
-
 size_t MainWindow::ImportPhotoFilesFrom(const std::vector<std::wstring>& files) {
     const std::wstring directory = PhotoDirectory();
     if (directory.empty() || !paths::EnsureDirectory(directory)) {
@@ -2028,16 +2760,39 @@ void MainWindow::SaveAllAlbumPhotos() {
         ShowToast(L"相册暂无照片");
         return;
     }
+    // 先进入多选模式，勾选后由「确定」执行批量导出
+    albumPanel_.SetMode(AlbumPanel::Mode::SaveSelect);
+    albumPanelDirty_ = true;
+    ShowToast(L"请勾选要保存的照片，然后点击「确定」");
+}
+
+void MainWindow::ConfirmSelectedPhotosSave() {
+    const std::vector<size_t> selection = albumPanel_.selection();
+    if (selection.empty()) {
+        ShowToast(L"请先勾选要保存的照片");
+        return;
+    }
     std::wstring folder;
-    if (!PickFolderDialog(hwnd_, paths::DesktopDir(), folder)) {
-        return; // 用户取消
+    if (hwnd_ == nullptr || !PickFolderDialog(hwnd_, paths::DesktopDir(), folder)) {
+        return; // 用户取消：保持多选状态
     }
     // 当前编辑中的笔迹先落盘，保证导出内容与界面一致
     SaveAnnotation();
     const bool withAnnotation = albumPanel_.composeAnnotation();
-    const size_t total = photoLibrary_.size();
-    const size_t saved = ExportAlbumPhotosTo(folder, withAnnotation);
-    ShowToast(BatchResultText(L"保存", saved, total));
+    size_t saved = 0;
+    for (const size_t index : selection) {
+        if (index >= photoLibrary_.size()) {
+            continue;
+        }
+        const std::wstring target =
+            UniqueTargetPath(paths::JoinPath(folder, photoLibrary_.at(index).name));
+        if (ExportPhoto(index, target, withAnnotation)) {
+            ++saved;
+        }
+    }
+    ShowToast(BatchResultText(L"保存", saved, selection.size()));
+    albumPanel_.SetMode(AlbumPanel::Mode::Normal);
+    albumPanelDirty_ = true;
 }
 
 void MainWindow::ImportAlbumPhotos() {
@@ -2135,9 +2890,8 @@ void MainWindow::CapturePhoto() {
 
     // 笔迹与原画面分离：笔迹单独存为该照片的笔迹文件，
     // 相册中查看时笔迹可继续擦除，导出时再按需合成
-    const bool hasAnnotation = annotation_.valid() &&
-                               annotation_.width() == pictureWidth_ &&
-                               annotation_.height() == pictureHeight_ && !annotation_.empty();
+    const bool hasAnnotation =
+        annotation_.matches(pictureWidth_, pictureHeight_) && !annotation_.empty();
     if (hasAnnotation) {
         annotation::SaveToFile(AnnotationPath(photoName), annotation_);
     }
@@ -2145,6 +2899,8 @@ void MainWindow::CapturePhoto() {
             path.c_str(), pictureWidth_, pictureHeight_);
     // 以全屏白闪作为拍照反馈，避免文字提示遮挡画面内容
     flashStartMs_ = ::GetTickCount64();
+    // 拍照后自动展开相册：照片由后台保存线程完成后刷新到面板
+    OpenAlbumPanel();
     // 相册面板展开时，保存线程完成后由 OnTimer 刷新，届时新照片才会落盘
 }
 

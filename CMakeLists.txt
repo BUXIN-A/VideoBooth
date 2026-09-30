@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(VideoBooth VERSION 1.1.0 LANGUAGES CXX)
+project(VideoBooth VERSION 1.2.0 LANGUAGES CXX)
 
 if(NOT MSVC)
     message(FATAL_ERROR "VideoBooth 当前仅支持 MSVC 工具链构建")
@@ -30,7 +30,9 @@ add_executable(VideoBooth WIN32
     "${CMAKE_SOURCE_DIR}/resources/app.rc")
 
 set_target_properties(VideoBooth PROPERTIES
-    VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:VideoBooth>")
+    VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:VideoBooth>"
+    # 静态链接 MSVC 运行库：目标机器无需安装 VC++ 运行库
+    MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 target_include_directories(VideoBooth PRIVATE
     "${CMAKE_SOURCE_DIR}/src"
