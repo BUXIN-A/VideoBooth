@@ -1168,6 +1168,9 @@ void SettingsDialog::DrawAboutPage() {
     canvas_.DrawText(L"面向学校低配教学一体机的高性能视频展台，零第三方依赖。",
                      {textLeft, nameTop + px(58.0f), textRight, nameTop + px(80.0f)}, px(13.0f),
                      kHintColor, 255, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    canvas_.DrawText(L"Produce By Bu Xin",
+                     {textLeft, nameTop + px(58.0f), textRight, nameTop + px(112.0f)}, px(13.0f),
+                     kHintColor, 255, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
 
     DrawButton(aboutCheckRect_, L"检查更新", false, hover_.field == Field::CheckUpdate);
 
